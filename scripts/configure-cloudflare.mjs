@@ -1,4 +1,4 @@
-import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { appendFileSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 
 const accountPattern = /^[a-f0-9]{32}$/i;
 const databasePattern = /^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/i;
@@ -114,6 +114,24 @@ async function configure() {
 }
 
 try { await configure(); } catch (error) {
-  console.error(error instanceof Error ? error.message : 'Cloudflare 배포 설정을 준비하지 못했습니다.');
+  const message = error instanceof Error ? error.message : 'Cloudflare 배포 설정을 준비하지 못했습니다.';
+  const annotation = message.replaceAll('%', '%25').replaceAll('\r', '%0D').replaceAll('\n', '%0A');
+  console.error(`::error title=Cloudflare 배포 설정 확인::${annotation}`);
+  if (process.env.GITHUB_STEP_SUMMARY) {
+    appendFileSync(process.env.GITHUB_STEP_SUMMARY, [
+      '## Cloudflare 배포 설정을 확인해 주세요',
+      '', message, '',
+      '[Repository secrets 설정 열기](https://github.com/kaiyen475/mygit/settings/secrets/actions)',
+      '',
+      '**Secrets → New repository secret**에서 다음 이름을 정확히 등록하세요:',
+      '',
+      '- `CLOUDFLARE_API_TOKEN`: Cloudflare 배포 토큰',
+      '- `CLOUDFLARE_ACCOUNT_ID`: 32자 Cloudflare Account ID',
+      '- `ADMIN_PASSWORD`: 운영자 비밀번호',
+      '',
+      '[처음 설정 방법](https://github.com/kaiyen475/mygit/blob/main/DEPLOY.md)',
+      '',
+    ].join('\n'));
+  }
   process.exitCode = 1;
 }
