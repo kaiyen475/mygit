@@ -46,6 +46,10 @@ jobs:
         run: |
           set -euo pipefail
           printf '%s' "$ADMIN_PASSWORD" | npx --no-install wrangler secret put ADMIN_PASSWORD --config .sites-runtime/wrangler.json
+      - name: Verify live application
+        env:
+          DEPLOYMENT_URL: ${{ steps.cloudflare.outputs.deployment-url }}
+        run: node scripts/verify-deployment.mjs
       - name: Deployment summary
         env:
           DEPLOYMENT_URL: ${{ steps.cloudflare.outputs.deployment-url }}

@@ -32,8 +32,8 @@ D1 Database ID를 직접 찾거나 데이터베이스를 만들 필요가 없습
 
 데이터베이스는 재배포해도 유지되며, 이미 적용한 마이그레이션은 반복 실행하지 않습니다. 비밀번호를 바꿀 때에는 `ADMIN_PASSWORD` Secret을 수정한 뒤 워크플로를 다시 실행하세요.
 
-## 공개 화면 미리보기
+## 현재 실제 사이트
 
-현재 https://kaiyen475.github.io/mygit/ 는 GitHub Pages의 화면 미리보기입니다. 신청 저장과 운영자 로그인은 위 서버 배포가 성공한 `workers.dev` 주소에서 사용할 수 있습니다.
+https://vitall-field-notes.ki955725.workers.dev/ 에서 실제 신청 저장과 운영자 로그인을 사용할 수 있습니다. https://kaiyen475.github.io/mygit/ 도 이 실제 사이트로 연결합니다. GitHub Pages 연결 주소는 deployment.json에서 관리합니다.
 
 `.dev.vars`, `.env`, `.sites-runtime`과 실제 신청자 데이터는 저장소에 올리지 않습니다. GitHub와 Cloudflare의 비밀 설정에 넣은 값은 소스나 브라우저에 공개되지 않습니다.

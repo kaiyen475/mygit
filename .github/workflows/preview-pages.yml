@@ -28,9 +28,7 @@ jobs:
       - name: Build public preview
         run: |
           node --no-warnings build-free.mjs
-          mkdir -p .sites-runtime/pages
-          cp preview.html .sites-runtime/pages/index.html
-          touch .sites-runtime/pages/.nojekyll
+          node build-pages.mjs
       - uses: actions/configure-pages@v5
         with:
           enablement: false

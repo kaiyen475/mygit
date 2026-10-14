@@ -2,19 +2,17 @@
 
 생태연구회 VITALL의 탐사 공지·신청 웹사이트입니다. 사이트 소스와 자동 배포 설정을 제공합니다.
 
-## 웹 화면을 먼저 공개하기
+## 실제 사이트
 
-1. [저장소의 Pages 설정](https://github.com/kaiyen475/mygit/settings/pages)을 엽니다.
-2. **Build and deployment → Source → GitHub Actions**를 선택합니다.
-3. [Actions](https://github.com/kaiyen475/mygit/actions)에서 **Publish VITALL preview**를 선택하고 **Run workflow**를 누릅니다.
+**https://vitall-field-notes.ki955725.workers.dev/**
 
-배포 성공 후 접속할 주소: **https://kaiyen475.github.io/mygit/**
+https://kaiyen475.github.io/mygit/ 에 접속해도 실제 사이트로 이동합니다. 회원가입 없이 탐사에 신청하고, 관리자 비밀번호를 입력하면 공지를 작성하고 신청자 전체 정보를 확인할 수 있습니다.
 
-이 화면은 미리보기입니다. 예시 탐사를 조회할 수 있으며 신청 정보를 저장하지 않습니다. 실제 신청 기능은 아래 서버 배포를 완료하면 사용할 수 있습니다.
+운영자는 처음 표시되는 예시를 수정하거나 실제 탐사를 새로 등록해 신청을 받습니다. 예시에는 신청할 수 없습니다.
 
 ## 실제 신청 기능 배포
 
-[DEPLOY.md](DEPLOY.md)의 처음 한 번 설정을 따라 GitHub Actions Secrets에 Cloudflare 토큰, Account ID, 운영자 비밀번호를 넣으면 됩니다. 데이터베이스 생성과 서버 배포는 자동으로 수행됩니다. 운영자 비밀번호는 서버의 비밀 값으로 관리하며, 신청 정보는 공용 D1 데이터베이스에 저장합니다.
+Cloudflare Worker와 D1의 배포가 완료되었습니다. 이후 main에 변경 사항을 올리면 데이터베이스를 유지하면서 자동으로 업데이트합니다. 다른 계정에서 처음 배포할 때의 설정 방법은 [DEPLOY.md](DEPLOY.md)에 있습니다. 운영자 비밀번호는 서버의 비밀 값으로 관리하며, 신청 정보는 공용 D1 데이터베이스에 저장합니다.
 
 - 누구나 회원가입 없이 신청
 - 이름, 전화번호, 쌍안경·장화 대여, 집합 장소, 탐사 후 식사 여부
