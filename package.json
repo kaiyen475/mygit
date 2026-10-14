@@ -1,0 +1,12 @@
+{
+  "name": "vitall-field-notes",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "engines": {"node": ">=24"},
+  "scripts": {
+    "build": "node --no-warnings build-free.mjs",
+    "test": "node --no-warnings scripts/verify-free.mjs",
+    "start": "python3 server.py --open"
+  }
+}

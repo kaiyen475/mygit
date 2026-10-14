@@ -1,0 +1,14 @@
+node_modules/
+dist/
+.next/
+.vinext/
+.wrangler/
+.sites-runtime/
+.env
+.env.*
+!.env.example
+.dev.vars
+.dev.vars.*
+*.tsbuildinfo
+.vitall-data/
+__pycache__/

@@ -1,0 +1,57 @@
+name: Deploy VITALL to Cloudflare
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: vitall-cloudflare-production
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    env:
+      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+      CLOUDFLARE_ACCOUNT_ID: ${{ vars.CLOUDFLARE_ACCOUNT_ID || secrets.CLOUDFLARE_ACCOUNT_ID }}
+      CLOUDFLARE_D1_DATABASE_ID: ${{ vars.CLOUDFLARE_D1_DATABASE_ID || secrets.CLOUDFLARE_D1_DATABASE_ID }}
+      ADMIN_PASSWORD: ${{ secrets.ADMIN_PASSWORD }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+      - name: Validate deployment settings
+        run: node scripts/configure-cloudflare.mjs
+      - name: Verify API and build Worker
+        run: |
+          node --no-warnings scripts/verify-free.mjs
+          node --no-warnings build-free.mjs
+      - name: Apply database migrations and deploy
+        id: cloudflare
+        uses: cloudflare/wrangler-action@v3
+        with:
+          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          accountId: ${{ vars.CLOUDFLARE_ACCOUNT_ID || secrets.CLOUDFLARE_ACCOUNT_ID }}
+          wranglerVersion: '4'
+          command: |
+            d1 migrations apply DB --remote --config .sites-runtime/wrangler.json
+            deploy --config .sites-runtime/wrangler.json
+      - name: Set private administrator password
+        shell: bash
+        run: |
+          set -euo pipefail
+          printf '%s' "$ADMIN_PASSWORD" | npx --no-install wrangler secret put ADMIN_PASSWORD --config .sites-runtime/wrangler.json
+      - name: Deployment summary
+        env:
+          DEPLOYMENT_URL: ${{ steps.cloudflare.outputs.deployment-url }}
+        run: |
+          echo '### VITALL 배포 완료' >> "$GITHUB_STEP_SUMMARY"
+          echo '신청 정보는 Cloudflare D1에 저장됩니다.' >> "$GITHUB_STEP_SUMMARY"
+          if [ -n "$DEPLOYMENT_URL" ]; then
+            printf '\n사이트 주소: %s\n' "$DEPLOYMENT_URL" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo '사이트 주소는 위 Wrangler 배포 로그의 workers.dev 주소에서 확인하세요.' >> "$GITHUB_STEP_SUMMARY"
+          fi

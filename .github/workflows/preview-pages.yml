@@ -1,0 +1,51 @@
+name: Publish VITALL preview
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: vitall-github-pages
+  cancel-in-progress: true
+
+jobs:
+  build:
+    if: github.event.repository.private == false
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+      - name: Verify application API
+        run: node --no-warnings scripts/verify-free.mjs
+      - name: Build public preview
+        run: |
+          node --no-warnings build-free.mjs
+          mkdir -p .sites-runtime/pages
+          cp preview.html .sites-runtime/pages/index.html
+          touch .sites-runtime/pages/.nojekyll
+      - uses: actions/configure-pages@v5
+        with:
+          enablement: false
+          token: ${{ github.token }}
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: .sites-runtime/pages
+  deploy:
+    needs: build
+    if: github.event.repository.private == false
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy preview to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
