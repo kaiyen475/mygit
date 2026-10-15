@@ -30,6 +30,9 @@ CATEGORIES = ("조류", "식물", "습지", "곤충", "기타")
 COOKIE_NAME = "vitall_admin"
 SESSION_SECONDS = 8 * 60 * 60
 LOGIN_WINDOW_MS = 15 * 60 * 1000
+MAX_PHOTO_BYTES = 1024 * 1024
+MAX_EVENT_PHOTOS = 5
+PHOTO_CONTENT_TYPES = frozenset(("image/jpeg", "image/png", "image/webp"))
 
 EXAMPLES = [
     {
@@ -72,12 +75,20 @@ CREATE TABLE IF NOT EXISTS applicants (
     name TEXT NOT NULL, phone TEXT NOT NULL,
     binoculars INTEGER NOT NULL CHECK(binoculars IN (0,1)),
     boots INTEGER NOT NULL CHECK(boots IN (0,1)), meeting_place TEXT NOT NULL,
-    meal INTEGER NOT NULL CHECK(meal IN (0,1)), idempotency_key TEXT NOT NULL,
+    meal INTEGER NOT NULL CHECK(meal IN (0,1)), message TEXT NOT NULL DEFAULT '',
+    idempotency_key TEXT NOT NULL,
     created_at TEXT NOT NULL
 );
 CREATE UNIQUE INDEX IF NOT EXISTS application_request_unique ON applicants(idempotency_key);
 CREATE UNIQUE INDEX IF NOT EXISTS application_person_unique ON applicants(event_id,name,phone);
 CREATE INDEX IF NOT EXISTS application_event_index ON applicants(event_id);
+CREATE TABLE IF NOT EXISTS expedition_photos (
+    id TEXT PRIMARY KEY, event_id TEXT NOT NULL REFERENCES expeditions(id),
+    content_type TEXT NOT NULL, data BLOB NOT NULL, sha256 TEXT NOT NULL,
+    size INTEGER NOT NULL, created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS expedition_photos_event_index ON expedition_photos(event_id);
+CREATE TABLE IF NOT EXISTS deleted_examples (id TEXT PRIMARY KEY, created_at TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS admin_sessions (token_hash TEXT PRIMARY KEY, expires_at INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS login_attempts (key TEXT PRIMARY KEY, failures INTEGER NOT NULL DEFAULT 0, window_start INTEGER NOT NULL);
 """
@@ -91,7 +102,7 @@ class HttpError(Exception):
 
 @dataclass
 class ApiResponse:
-    body: dict
+    body: dict | bytes
     status: int = 200
     headers: dict[str, str] = field(default_factory=dict)
 
@@ -112,6 +123,16 @@ def text_value(value, label: str, minimum: int = 1, maximum: int = 200) -> str:
     if not isinstance(value, str) or not minimum <= len(value.strip()) <= maximum:
         raise HttpError(400, f"{label}을(를) 확인해 주세요.")
     return value.strip()
+
+
+def applicant_message(value) -> str:
+    if not isinstance(value, str):
+        raise HttpError(400, "하고 싶은 말을 확인해 주세요.")
+    # Match JavaScript trim() and textarea maxlength, which counts UTF-16 units.
+    value = value.strip("\u0009\u000a\u000b\u000c\u000d\u0020\u00a0\u1680\u2000\u2001\u2002\u2003\u2004\u2005\u2006\u2007\u2008\u2009\u200a\u2028\u2029\u202f\u205f\u3000\ufeff")
+    if len(value.encode("utf-16-le", errors="surrogatepass")) // 2 > 1000:
+        raise HttpError(400, "하고 싶은 말은 1000자 이내로 입력해 주세요.")
+    return value
 
 
 def iso_date(value, label: str) -> str:
@@ -172,6 +193,10 @@ class VitallService:
         self._password_hash = self._hash_password(password)
         with self.connection() as connection:
             connection.executescript(SCHEMA)
+        with self.connection(transaction=True) as connection:
+            columns = {row["name"] for row in connection.execute("PRAGMA table_info(applicants)")}
+            if "message" not in columns:
+                connection.execute("ALTER TABLE applicants ADD COLUMN message TEXT NOT NULL DEFAULT ''")
             # Restarting or changing the password revokes previously issued sessions.
             connection.execute("DELETE FROM admin_sessions")
         try:
@@ -225,14 +250,23 @@ class VitallService:
             raise HttpError(401, "운영자 비밀번호를 먼저 입력해 주세요.")
 
     @staticmethod
-    def map_event(row) -> dict:
+    def map_event(row, photos: list[dict] | None = None) -> dict:
         return {
             "id": row["id"], "title": row["title"], "category": row["category"],
             "date": row["date"], "deadline": row["deadline"], "location": row["location"],
             "description": row["description"], "meetingPlaces": json.loads(row["meeting_places"]),
             "capacity": row["capacity"], "status": row["status"],
             "isExample": bool(row["is_example"]), "count": int(row["count"]),
+            "photos": photos or [],
         }
+
+    @staticmethod
+    def photo_metadata(photo_id: str) -> dict:
+        return {"id": photo_id, "url": f"/api/photos/{photo_id}"}
+
+    def event_photos(self, connection, event_id: str) -> list[dict]:
+        return [self.photo_metadata(row["id"]) for row in connection.execute(
+            "SELECT id FROM expedition_photos WHERE event_id=? ORDER BY created_at,id", (event_id,))]
 
     def event_by_id(self, connection, event_id: str) -> dict:
         row = connection.execute(
@@ -240,18 +274,27 @@ class VitallService:
             (event_id,),
         ).fetchone()
         if row:
-            return self.map_event(row)
-        for example in EXAMPLES:
+            return self.map_event(row, self.event_photos(connection, event_id))
+        for example in self.visible_examples(connection):
             if example["id"] == event_id:
                 return dict(example)
         raise HttpError(404, "탐사 게시물을 찾을 수 없습니다.")
 
     @staticmethod
-    def validate_body(body, headers: dict, origin: str):
+    def visible_examples(connection) -> list[dict]:
+        deleted = {row["id"] for row in connection.execute("SELECT id FROM deleted_examples")}
+        return [dict(example, photos=[]) for example in EXAMPLES if example["id"] not in deleted]
+
+    @staticmethod
+    def validate_origin(headers: dict, origin: str):
         if headers.get("origin") and headers["origin"] != origin:
             raise HttpError(403, "허용되지 않은 요청입니다.")
         if headers.get("sec-fetch-site") == "cross-site":
             raise HttpError(403, "허용되지 않은 요청입니다.")
+
+    @staticmethod
+    def validate_body(body, headers: dict, origin: str):
+        VitallService.validate_origin(headers, origin)
         if headers.get("content-type", "").split(";", 1)[0].strip().lower() != "application/json":
             raise HttpError(415, "JSON 형식으로 요청해 주세요.")
         if not isinstance(body, dict):
@@ -264,8 +307,32 @@ class VitallService:
         headers = {key.lower(): value for key, value in (headers or {}).items()}
         path = urlsplit(path).path
         try:
-            if method in ("POST", "PUT"):
-                self.validate_body(body, headers, origin)
+            upload_match = re.fullmatch(r"/api/expeditions/([^/]+)/photos", path)
+            if method in ("POST", "PUT", "DELETE"):
+                if upload_match and method == "POST":
+                    self.validate_origin(headers, origin)
+                else:
+                    self.validate_body(body, headers, origin)
+            if upload_match:
+                if method != "POST":
+                    raise HttpError(405, "지원하지 않는 요청입니다.")
+                event_id = unquote(upload_match.group(1))
+                if len(event_id) > 150:
+                    raise HttpError(400, "탐사 식별값을 확인해 주세요.")
+                return self.upload_photo(event_id, body, headers)
+            photo_delete_match = re.fullmatch(r"/api/expeditions/([^/]+)/photos/([^/]+)", path)
+            if photo_delete_match:
+                if method != "DELETE":
+                    raise HttpError(405, "지원하지 않는 요청입니다.")
+                event_id, photo_id = map(unquote, photo_delete_match.groups())
+                if max(len(event_id), len(photo_id)) > 150:
+                    raise HttpError(400, "사진 식별값을 확인해 주세요.")
+                return self.delete_photo(event_id, photo_id, headers)
+            photo_match = re.fullmatch(r"/api/photos/([^/]+)", path)
+            if photo_match:
+                if method not in ("GET", "HEAD"):
+                    raise HttpError(405, "지원하지 않는 요청입니다.")
+                return self.photo(unquote(photo_match.group(1)))
             if path == "/api/admin/login" and method == "POST":
                 return self.login(body, client_ip, origin)
             if path == "/api/admin/logout" and method == "POST":
@@ -278,7 +345,11 @@ class VitallService:
                 if method == "GET":
                     with self.connection() as connection:
                         rows = connection.execute("SELECT e.*, (SELECT COUNT(*) FROM applicants a WHERE a.event_id=e.id) AS count FROM expeditions e ORDER BY e.date DESC").fetchall()
-                        return ApiResponse({"events": [self.map_event(row) for row in rows] or EXAMPLES,
+                        photos_by_event = {}
+                        if rows:
+                            for photo in connection.execute("SELECT p.id,p.event_id FROM expedition_photos p JOIN expeditions e ON e.id=p.event_id ORDER BY p.created_at,p.id"):
+                                photos_by_event.setdefault(photo["event_id"], []).append(self.photo_metadata(photo["id"]))
+                        return ApiResponse({"events": [self.map_event(row, photos_by_event.get(row["id"])) for row in rows] or self.visible_examples(connection),
                                             "admin": self.current_admin(connection, headers)})
                 if method == "POST":
                     return self.save_event(body, headers)
@@ -296,6 +367,8 @@ class VitallService:
                     return self.detail(event_id, headers)
                 if method == "PUT":
                     return self.save_event(body, headers, event_id)
+                if method == "DELETE":
+                    return self.delete_event(event_id, headers)
                 raise HttpError(405, "지원하지 않는 요청입니다.")
             if path in ("/api/admin/login", "/api/admin/logout"):
                 raise HttpError(405, "지원하지 않는 요청입니다.")
@@ -341,11 +414,12 @@ class VitallService:
             names = [] if event["isExample"] else connection.execute("SELECT name FROM applicants WHERE event_id=? ORDER BY created_at,id", (event_id,)).fetchall()
             result = {"event": event, "signedUp": [{"name": row["name"]} for row in names], "admin": admin}
             if admin:
-                rows = [] if event["isExample"] else connection.execute("SELECT id,name,phone,binoculars,boots,meeting_place,meal,created_at FROM applicants WHERE event_id=? ORDER BY created_at,id", (event_id,)).fetchall()
+                rows = [] if event["isExample"] else connection.execute("SELECT id,name,phone,binoculars,boots,meeting_place,meal,message,created_at FROM applicants WHERE event_id=? ORDER BY created_at,id", (event_id,)).fetchall()
                 result["applicants"] = [{
                     "id": row["id"], "name": row["name"], "phone": row["phone"],
                     "binoculars": bool(row["binoculars"]), "boots": bool(row["boots"]),
                     "meetingPlace": row["meeting_place"], "meal": bool(row["meal"]),
+                    "message": row["message"],
                     "createdAt": row["created_at"],
                 } for row in rows]
             return ApiResponse(result)
@@ -354,24 +428,96 @@ class VitallService:
         with self.connection(transaction=True) as connection:
             self.require_admin(connection, headers)
             event = event_input(body)
+            existing_row = None
             if event_id:
                 old = self.event_by_id(connection, event_id)
+                existing_row = connection.execute("SELECT id FROM expeditions WHERE id=?", (event_id,)).fetchone()
                 if 0 < event["capacity"] < old["count"]:
                     raise HttpError(400, "정원을 현재 신청 인원보다 적게 설정할 수 없습니다.")
                 if old["count"] and any(place not in event["meetingPlaces"] for place in old["meetingPlaces"]):
                     raise HttpError(400, "신청자가 있는 탐사의 집합 장소는 유지하고 새 장소를 추가해 주세요.")
-            actual_id = event_id if event_id and not event_id.startswith("example-") else str(uuid.uuid4())
-            connection.execute("""INSERT INTO expeditions(id,title,category,date,deadline,location,description,meeting_places,capacity,status,is_example,created_at)
-                VALUES(?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET title=excluded.title,
-                category=excluded.category,date=excluded.date,deadline=excluded.deadline,location=excluded.location,
-                description=excluded.description,meeting_places=excluded.meeting_places,capacity=excluded.capacity,
-                status=excluded.status,is_example=excluded.is_example""", (
-                    actual_id, event["title"], event["category"], event["date"], event["deadline"],
-                    event["location"], event["description"], json.dumps(event["meetingPlaces"], ensure_ascii=False),
-                    event["capacity"], event["status"], int(event["isExample"]), utc_now(),
-                ))
+            actual_id = event_id if existing_row else str(uuid.uuid4())
+            values = (
+                event["title"], event["category"], event["date"], event["deadline"],
+                event["location"], event["description"], json.dumps(event["meetingPlaces"], ensure_ascii=False),
+                event["capacity"], event["status"], int(event["isExample"]),
+            )
+            if existing_row:
+                connection.execute("""UPDATE expeditions SET title=?,category=?,date=?,deadline=?,location=?,
+                    description=?,meeting_places=?,capacity=?,status=?,is_example=? WHERE id=?""", (*values, actual_id))
+            else:
+                connection.execute("""INSERT INTO expeditions(id,title,category,date,deadline,location,description,meeting_places,capacity,status,is_example,created_at)
+                    VALUES(?,?,?,?,?,?,?,?,?,?,?,?)""", (actual_id, *values, utc_now()))
             saved = self.event_by_id(connection, actual_id)
         return ApiResponse({"success": True, "event": saved}, 200 if event_id else 201)
+
+    def delete_event(self, event_id: str, headers: dict) -> ApiResponse:
+        with self.connection(transaction=True) as connection:
+            self.require_admin(connection, headers)
+            self.event_by_id(connection, event_id)
+            existing_row = connection.execute("SELECT id FROM expeditions WHERE id=?", (event_id,)).fetchone()
+            if existing_row:
+                connection.execute("DELETE FROM expedition_photos WHERE event_id=?", (event_id,))
+                connection.execute("DELETE FROM applicants WHERE event_id=?", (event_id,))
+                connection.execute("DELETE FROM expeditions WHERE id=?", (event_id,))
+            else:
+                connection.execute("INSERT INTO deleted_examples(id,created_at) VALUES(?,?)", (event_id, utc_now()))
+        return ApiResponse({"success": True})
+
+    def upload_photo(self, event_id: str, body: bytes, headers: dict) -> ApiResponse:
+        with self.connection(transaction=True) as connection:
+            self.require_admin(connection, headers)
+            # Uploads belong to stored posts; built-in examples must first be saved.
+            self.event_by_id(connection, event_id)
+            if not connection.execute("SELECT id FROM expeditions WHERE id=?", (event_id,)).fetchone():
+                raise HttpError(400, "예시 탐사를 저장한 뒤 사진을 추가해 주세요.")
+            if not isinstance(body, bytes) or not body:
+                raise HttpError(400, "사진 파일을 선택해 주세요.")
+            if len(body) > MAX_PHOTO_BYTES:
+                raise HttpError(413, "사진은 한 장당 1MB 이하로 올려 주세요.")
+            content_type = headers.get("content-type", "").split(";", 1)[0].strip().lower()
+            if content_type not in PHOTO_CONTENT_TYPES:
+                raise HttpError(415, "JPG, PNG, WebP 사진만 올릴 수 있습니다.")
+            signatures = {
+                "image/jpeg": body.startswith(b"\xff\xd8\xff"),
+                "image/png": body.startswith(b"\x89PNG\r\n\x1a\n"),
+                "image/webp": len(body) >= 12 and body[:4] == b"RIFF" and body[8:12] == b"WEBP",
+            }
+            if not signatures[content_type]:
+                raise HttpError(415, "사진 파일 형식과 내용을 확인해 주세요.")
+            upload_id = headers.get("x-upload-id", "").lower()
+            try:
+                if str(uuid.UUID(upload_id)) != upload_id:
+                    raise ValueError
+            except (ValueError, AttributeError):
+                raise HttpError(400, "사진 업로드 식별값을 확인해 주세요.") from None
+            file_hash = hashlib.sha256(body).hexdigest()
+            existing = connection.execute("SELECT event_id,sha256,content_type FROM expedition_photos WHERE id=?", (upload_id,)).fetchone()
+            if existing:
+                if tuple(existing) != (event_id, file_hash, content_type):
+                    raise HttpError(409, "다른 사진에 사용된 업로드 식별값입니다. 다시 시도해 주세요.")
+                return ApiResponse({"success": True, "photo": self.photo_metadata(upload_id)})
+            count = connection.execute("SELECT COUNT(*) FROM expedition_photos WHERE event_id=?", (event_id,)).fetchone()[0]
+            if count >= MAX_EVENT_PHOTOS:
+                raise HttpError(409, "사진은 탐사 게시물당 최대 5장까지 올릴 수 있습니다.")
+            connection.execute("INSERT INTO expedition_photos(id,event_id,content_type,data,sha256,size,created_at) VALUES(?,?,?,?,?,?,?)",
+                               (upload_id, event_id, content_type, body, file_hash, len(body), utc_now()))
+        return ApiResponse({"success": True, "photo": self.photo_metadata(upload_id)}, 201)
+
+    def delete_photo(self, event_id: str, photo_id: str, headers: dict) -> ApiResponse:
+        with self.connection(transaction=True) as connection:
+            self.require_admin(connection, headers)
+            self.event_by_id(connection, event_id)
+            connection.execute("DELETE FROM expedition_photos WHERE id=? AND event_id=?", (photo_id, event_id))
+        return ApiResponse({"success": True})
+
+    def photo(self, photo_id: str) -> ApiResponse:
+        with self.connection() as connection:
+            row = connection.execute("SELECT p.content_type,p.data FROM expedition_photos p JOIN expeditions e ON e.id=p.event_id WHERE p.id=?", (photo_id,)).fetchone()
+        if not row or row["content_type"] not in PHOTO_CONTENT_TYPES:
+            raise HttpError(404, "사진을 찾을 수 없습니다.")
+        return ApiResponse(bytes(row["data"]), headers={"Content-Type": row["content_type"],
+                           "Cache-Control": "no-store", "X-Content-Type-Options": "nosniff"})
 
     def apply(self, event_id: str, body: dict) -> ApiResponse:
         name = text_value(body.get("name"), "이름", 1, 50)
@@ -383,14 +529,15 @@ class VitallService:
         if body.get("consent") is not True:
             raise HttpError(400, "개인정보 수집 안내에 동의해 주세요.")
         meeting_place = text_value(body.get("meetingPlace"), "집합 장소", 1, 150)
+        message = applicant_message(body.get("message", ""))
         key = text_value(body.get("idempotencyKey"), "신청 식별값", 8, 100)
-        expected = (event_id, name, phone, int(body["binoculars"]), int(body["boots"]), meeting_place, int(body["meal"]))
+        expected = (event_id, name, phone, int(body["binoculars"]), int(body["boots"]), meeting_place, int(body["meal"]), message)
         # A write transaction serializes last-place claims, duplicate checks and edits.
         with self.connection(transaction=True) as connection:
             event = self.event_by_id(connection, event_id)
             if meeting_place not in event["meetingPlaces"]:
                 raise HttpError(400, "등록된 집합 장소를 선택해 주세요.")
-            prior = connection.execute("SELECT event_id,name,phone,binoculars,boots,meeting_place,meal FROM applicants WHERE idempotency_key=?", (key,)).fetchone()
+            prior = connection.execute("SELECT event_id,name,phone,binoculars,boots,meeting_place,meal,message FROM applicants WHERE idempotency_key=?", (key,)).fetchone()
             if prior:
                 if tuple(prior) != expected:
                     raise HttpError(409, "신청 정보를 다시 확인해 주세요.")
@@ -405,7 +552,7 @@ class VitallService:
                 raise HttpError(409, "동일한 이름과 전화번호로 이미 신청하셨습니다.")
             if event["capacity"] > 0 and event["count"] >= event["capacity"]:
                 raise HttpError(409, "신청 정원이 찼습니다.")
-            connection.execute("INSERT INTO applicants(id,event_id,name,phone,binoculars,boots,meeting_place,meal,idempotency_key,created_at) VALUES(?,?,?,?,?,?,?,?,?,?)", (str(uuid.uuid4()), *expected, key, now))
+            connection.execute("INSERT INTO applicants(id,event_id,name,phone,binoculars,boots,meeting_place,meal,message,idempotency_key,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)", (str(uuid.uuid4()), *expected, key, now))
             count = self.event_by_id(connection, event_id)["count"]
         return ApiResponse({"success": True, "name": name, "count": count}, 201)
 
@@ -436,6 +583,13 @@ def make_handler(service: VitallService, public_directory: Path):
                     pass
 
         def json_response(self, response: ApiResponse):
+            if isinstance(response.body, bytes):
+                headers = dict(response.headers)
+                content_type = headers.pop("Content-Type", "application/octet-stream")
+                headers.pop("Cache-Control", None)
+                headers.pop("X-Content-Type-Options", None)
+                self.respond(response.body, response.status, content_type, headers)
+                return
             self.respond(json.dumps(response.body, ensure_ascii=False).encode("utf-8"), response.status, headers=response.headers)
 
         def handle_request(self):
@@ -451,7 +605,8 @@ def make_handler(service: VitallService, public_directory: Path):
                 path = urlsplit(self.path).path
                 if path.startswith("/api/"):
                     body = None
-                    if self.command in ("POST", "PUT"):
+                    if self.command in ("POST", "PUT", "DELETE"):
+                        raw_upload = self.command == "POST" and re.fullmatch(r"/api/expeditions/[^/]+/photos", path)
                         if self.headers.get("Transfer-Encoding"):
                             self.close_connection = True
                             raise HttpError(400, "요청 형식을 확인해 주세요.")
@@ -460,16 +615,20 @@ def make_handler(service: VitallService, public_directory: Path):
                         except ValueError:
                             self.close_connection = True
                             raise HttpError(400, "요청 형식을 확인해 주세요.") from None
-                        if not 0 <= length <= 65536:
+                        if not 0 <= length <= (MAX_PHOTO_BYTES if raw_upload else 65536):
                             self.close_connection = True
-                            raise HttpError(413, "입력 내용이 너무 깁니다.")
-                        try:
-                            raw = self.rfile.read(length).decode("utf-8")
-                            if len(raw) > 16000:
-                                raise HttpError(413, "입력 내용이 너무 깁니다.")
-                            body = json.loads(raw)
-                        except (ValueError, UnicodeError):
-                            raise HttpError(400, "입력 내용을 확인해 주세요.") from None
+                            raise HttpError(413, "사진은 한 장당 1MB 이하로 올려 주세요." if raw_upload else "입력 내용이 너무 깁니다.")
+                        raw = self.rfile.read(length)
+                        if raw_upload:
+                            body = raw
+                        else:
+                            try:
+                                text = raw.decode("utf-8")
+                                if len(text) > 16000:
+                                    raise HttpError(413, "입력 내용이 너무 깁니다.")
+                                body = json.loads(text)
+                            except (ValueError, UnicodeError):
+                                raise HttpError(400, "입력 내용을 확인해 주세요.") from None
                     response = service.request(self.command, path, body, dict(self.headers),
                                                f"http://{host}", self.client_address[0])
                     self.json_response(response)

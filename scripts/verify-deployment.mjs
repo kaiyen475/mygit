@@ -12,6 +12,13 @@ function passed(message) {
   console.log(`PASS: ${message}`);
 }
 
+function validPhotos(event) {
+  return event && Array.isArray(event.photos) && event.photos.length <= 5 &&
+    event.photos.every(photo => photo && Object.keys(photo).sort().join(',') === 'id,url' &&
+      typeof photo.id === 'string' && /^[a-f0-9-]{36}$/.test(photo.id) &&
+      photo.url === `/api/photos/${photo.id}`);
+}
+
 function deploymentOrigin(value) {
   let url;
   try {
@@ -29,7 +36,7 @@ function deploymentOrigin(value) {
   return url.origin;
 }
 
-async function request(origin, path, { body, cookie } = {}) {
+async function request(origin, path, { body, cookie, method } = {}) {
   const headers = { Accept: 'application/json' };
   if (cookie) headers.Cookie = cookie;
   if (body !== undefined) {
@@ -38,7 +45,7 @@ async function request(origin, path, { body, cookie } = {}) {
   }
   try {
     return await fetch(new URL(path, origin), {
-      method: body === undefined ? 'GET' : 'POST',
+      method: method || (body === undefined ? 'GET' : 'POST'),
       headers,
       body: body === undefined ? undefined : JSON.stringify(body),
       redirect: 'error',
@@ -78,6 +85,7 @@ async function initialList(origin) {
     check(response.status === 200, 'Public expedition listing is unavailable.');
     const result = await json(response, 'Public expedition listing');
     check(result.admin === false && Array.isArray(result.events), 'Public expedition listing has an unexpected shape.');
+    check(result.events.every(validPhotos), 'Public photo metadata is unavailable or invalid.');
     passed('Database and public expedition listing are available.');
     return result;
   }
@@ -121,9 +129,14 @@ async function main() {
       const id = publicList.events[0]?.id;
       check(typeof id === 'string' && /^[a-zA-Z0-9-]{1,128}$/.test(id), 'An expedition has an invalid identifier.');
       const path = `/api/expeditions/${encodeURIComponent(id)}`;
+      const blockedDelete = await request(origin, path, { method: 'DELETE', body: {} });
+      check(blockedDelete.status === 401, 'Anonymous expedition deletion was not rejected.');
+      await blockedDelete.body?.cancel();
+      passed('Anonymous expedition deletion is blocked.');
       const publicDetailResponse = await request(origin, path);
       check(publicDetailResponse.status === 200, 'Public expedition detail failed.');
       const publicDetail = await json(publicDetailResponse, 'Public expedition detail');
+      check(validPhotos(publicDetail.event), 'Public expedition photo metadata is invalid.');
       check(
         publicDetail.admin === false && Array.isArray(publicDetail.signedUp) &&
           !Object.hasOwn(publicDetail, 'applicants') &&
@@ -132,10 +145,33 @@ async function main() {
       );
       passed('Public applicant information is limited to names.');
 
+      const unavailablePhoto = '00000000-0000-4000-8000-000000000000';
+      const blockedPhotoDelete = await request(origin, `${path}/photos/${unavailablePhoto}`, { method: 'DELETE', body: {} });
+      check(blockedPhotoDelete.status === 401, 'Anonymous photo deletion was not rejected.');
+      await blockedPhotoDelete.body?.cancel();
+      let blockedPhotoUpload;
+      try {
+        blockedPhotoUpload = await fetch(new URL(`${path}/photos`, origin), {
+          method: 'POST', headers: { Origin: origin, 'Content-Type': 'image/jpeg', 'X-Upload-Id': unavailablePhoto },
+          body: new Uint8Array([255, 216, 255]), redirect: 'error', signal: AbortSignal.timeout(20_000),
+        });
+      } catch { throw new RequestError('Photo authorization verification failed or timed out.'); }
+      check(blockedPhotoUpload.status === 401, 'Anonymous photo upload was not rejected.');
+      await blockedPhotoUpload.body?.cancel();
+      passed('Anonymous photo upload and deletion are blocked.');
+
+      if (publicDetail.event.photos.length) {
+        const photo = await request(origin, publicDetail.event.photos[0].url);
+        check(photo.status === 200 && ['image/jpeg', 'image/png', 'image/webp'].includes(photo.headers.get('content-type')), 'A published photo is unavailable.');
+        const size = (await photo.arrayBuffer()).byteLength;
+        check(size > 0 && size <= 1024 * 1024 && photo.headers.get('x-content-type-options') === 'nosniff', 'A published photo has invalid content headers or size.');
+        passed('Published photo delivery is working.');
+      }
+
       const adminDetailResponse = await request(origin, path, { cookie });
       check(adminDetailResponse.status === 200, 'Authenticated expedition detail failed.');
       const adminDetail = await json(adminDetailResponse, 'Authenticated expedition detail');
-      check(adminDetail.admin === true && Array.isArray(adminDetail.applicants), 'Administrator applicant access is unavailable.');
+      check(adminDetail.admin === true && Array.isArray(adminDetail.applicants) && adminDetail.applicants.every(applicant => typeof applicant.message === 'string'), 'Administrator applicant messages are unavailable.');
       passed('Administrator applicant detail access is working.');
     }
   } finally {

@@ -20,12 +20,24 @@ export default {
       if (request.method === 'GET') return api(request,'list');
       if (request.method === 'POST') return api(request,'save');
     }
+    const photo = path.match(/^\\/api\\/photos\\/([^/]+)$/);
+    if (photo && request.method === 'GET') {
+      let id; try { id=decodeURIComponent(photo[1]); } catch { return new Response('Invalid path',{status:400}); }
+      return api(request,'photo',id);
+    }
+    const photoAction = path.match(/^\\/api\\/expeditions\\/([^/]+)\\/photos(?:\\/([^/]+))?$/);
+    if (photoAction) {
+      let id,photoId; try { id=decodeURIComponent(photoAction[1]); photoId=photoAction[2]?decodeURIComponent(photoAction[2]):undefined; } catch { return new Response('Invalid path',{status:400}); }
+      if (!photoId && request.method === 'POST') return api(request,'uploadPhoto',id);
+      if (photoId && request.method === 'DELETE') return api(request,'deletePhoto',id,photoId);
+    }
     const match = path.match(/^\\/api\\/expeditions\\/([^/]+)(\\/apply)?$/);
     if (match) {
       let id; try { id=decodeURIComponent(match[1]); } catch { return new Response('Invalid path',{status:400}); }
       if (match[2] && request.method === 'POST') return api(request,'apply',id);
       if (!match[2] && request.method === 'GET') return api(request,'detail',id);
       if (!match[2] && request.method === 'PUT') return api(request,'save',id);
+      if (!match[2] && request.method === 'DELETE') return api(request,'delete',id);
     }
     if (path.startsWith('/api/')) return new Response(JSON.stringify({error:'지원하지 않는 요청입니다.'}),{status:404,headers:{'Content-Type':'application/json; charset=utf-8','Cache-Control':'no-store'}});
     const asset=assets[path];

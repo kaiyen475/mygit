@@ -23,6 +23,8 @@
     calendar: '<rect x="3" y="5" width="18" height="16" rx="2"/><path d="M16 3v4M8 3v4M3 11h18M8 15h.01M12 15h.01M16 15h.01"/>',
     share: '<circle cx="18" cy="5" r="3"/><circle cx="6" cy="12" r="3"/><circle cx="18" cy="19" r="3"/><path d="m8.6 10.5 6.8-4M8.6 13.5l6.8 4"/>',
     download: '<path d="M12 3v12m-5-5 5 5 5-5M5 17v4h14v-4"/>',
+    trash: '<path d="M3 6h18M9 6V4h6v2M5 6l1 15h12l1-15M10 10v7M14 10v7"/>',
+    camera: '<rect x="3" y="6" width="18" height="15" rx="2"/><path d="m8 6 2-3h4l2 3"/><circle cx="12" cy="13" r="4"/>',
   };
   const icon = (name, size = 16) => `<svg width="${size}" height="${size}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${icons[name] || icons.leaf}</svg>`;
   const escape = value => String(value ?? "").replace(/[&<>"']/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c]);
@@ -33,9 +35,10 @@
     { id: "example-plants", title: "숲의 계절을 읽는 상당산성 식물 탐사", category: "식물", date: "2026-11-07T01:00:00.000Z", deadline: "2026-11-06T09:00:00.000Z", location: "청주 상당산성", description: "숲길의 잎과 열매를 살펴보고, 식물의 겨울 준비를 관찰합니다. 천천히 걷고 함께 기록하는 탐사입니다.\n\n준비물: 걷기 편한 신발, 물, 작은 기록장\n\n이 게시물은 화면 안내를 위한 예시입니다.", meetingPlaces: ["충북대학교 정문", "상당산성 주차장"], capacity: 15, status: "open", isExample: true, count: 0 },
     { id: "example-wetland", title: "물과 생명이 만나는 대청호 습지 탐사", category: "습지", date: "2026-10-03T00:00:00.000Z", deadline: "2026-10-02T09:00:00.000Z", location: "대청호 주변 습지", description: "습지에 사는 생물과 주변의 생태를 함께 살펴보는 탐사 기록입니다.\n\n이 게시물은 지난 탐사 화면을 보여주기 위한 예시입니다.", meetingPlaces: ["충북대학교 정문", "대청호 현장 집합"], capacity: 20, status: "closed", isExample: true, count: 0 },
   ];
-  const blankApplication = () => ({ name: "", phone: "", binoculars: false, boots: false, meetingPlace: "", meal: false, consent: false });
+  const blankApplication = () => ({ name: "", phone: "", binoculars: false, boots: false, meetingPlace: "", meal: false, message: "", consent: false });
   const blankDraft = () => ({ title: "", category: "조류", date: "", deadline: "", location: "", description: "", meetingPlaces: "", capacity: "0", status: "open" });
-  const state = { events: [], admin: false, loading: true, preview: false, category: "전체", tab: "open", search: "", mode: null, eventId: null, detail: null, detailLoading: false, detailError: "", signup: false, successName: "", busy: false, error: "", editingId: null, draft: blankDraft(), application: blankApplication(), key: "" };
+  const blankPhotos = () => ({ existing: [], pending: [], removals: [] });
+  const state = { events: [], admin: false, loading: true, preview: false, previewExamples: true, category: "전체", tab: "open", search: "", mode: null, eventId: null, detail: null, detailLoading: false, detailError: "", signup: false, successName: "", busy: false, photoProcessing: false, photos: blankPhotos(), error: "", editingId: null, draft: blankDraft(), application: blankApplication(), key: "" };
   let previousFocus = null;
   let toastTimer;
   const $ = selector => document.querySelector(selector);
@@ -45,10 +48,14 @@
   function localDate(value) { return value ? new Date(new Date(value).getTime() + 9 * 3600000).toISOString().slice(0, 16) : ""; }
   function open(event) { return event.status === "open" && new Date(event.deadline).getTime() > Date.now() && new Date(event.date).getTime() > Date.now() && (!event.capacity || event.count < event.capacity); }
   function status(event) { if (new Date(event.date).getTime() < Date.now()) return "탐사 완료"; if (event.capacity && event.count >= event.capacity) return "정원 마감"; return open(event) ? "모집 중" : "신청 마감"; }
-  function uuid() { return crypto.randomUUID ? crypto.randomUUID() : Array.from(crypto.getRandomValues(new Uint8Array(16)), b => b.toString(16).padStart(2, "0")).join(""); }
+  function uuid() { if (crypto.randomUUID) return crypto.randomUUID(); const bytes = crypto.getRandomValues(new Uint8Array(16)); bytes[6] = (bytes[6] & 15) | 64; bytes[8] = (bytes[8] & 63) | 128; const hex = [...bytes].map(b => b.toString(16).padStart(2, "0")).join(""); return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`; }
+  const working = () => state.busy || state.photoProcessing;
+  // Only server-owned relative photo paths may be rendered as links or images.
+  function photoUrl(photo) { return typeof photo?.url === "string" && /^\/api\/photos\/[A-Za-z0-9-]+$/.test(photo.url) ? photo.url : ""; }
+  function resetPhotos() { for (const photo of state.photos.pending) URL.revokeObjectURL(photo.url); state.photos = blankPhotos(); }
   async function request(path, options = {}) { const response = await fetch(path, { ...options, headers: { "Content-Type": "application/json", ...options.headers }, cache: "no-store" }); let data; try { data = await response.json(); } catch { throw new Error("서버에 연결하지 못했어요. 잠시 후 다시 시도해 주세요."); } if (!response.ok) { const e = new Error(data.error || "요청을 처리하지 못했어요. 잠시 후 다시 시도해 주세요."); e.status = response.status; throw e; } return data; }
   function toast(message) { clearTimeout(toastTimer); $("#toast-root").innerHTML = `<div class="toast" role="status">${icon("checkCircle", 17)}${escape(message)}</div>`; toastTimer = setTimeout(() => { $("#toast-root").innerHTML = ""; }, 3500); }
-  function header() { $("#header-actions").innerHTML = state.admin ? `<button class="admin-signout" data-action="logout" ${state.busy ? "disabled" : ""}>운영자 모드 · 로그아웃</button><button class="button button-small" data-action="compose">${icon("plus", 15)} 탐사 글쓰기</button>` : `<button class="admin-button" data-action="login">${icon("lock", 14)}<span>관리자</span></button>`; }
+  function header() { $("#header-actions").innerHTML = state.admin ? `<button class="admin-signout" data-action="logout" ${working() ? "disabled" : ""}>운영자 모드 · 로그아웃</button><button class="button button-small" data-action="compose" ${working() ? "disabled" : ""}>${icon("plus", 15)} 탐사 글쓰기</button>` : `<button class="admin-button" data-action="login" ${working() ? "disabled" : ""}>${icon("lock", 14)}<span>관리자</span></button>`; }
 
   function shell() {
     $("#app").innerHTML = `<header class="site-header"><div class="header-inner"><a href="#" class="brand" aria-label="VITALL 홈"><span class="brand-mark">${icon("leaf", 22)}</span><span>VITALL<span class="brand-dot">.</span></span></a><nav aria-label="주 메뉴"><a href="#board" class="nav-active">탐사 게시판</a><button data-action="about">VITALL 소개 ${icon("up", 13)}</button></nav><div class="header-actions" id="header-actions"></div></div></header>
@@ -65,21 +72,22 @@
     const count = state.events.filter(open).length;
     const filtered = state.events.filter(e => (state.category === "전체" || e.category === state.category) && (state.tab === "all" || (state.tab === "open" ? open(e) : new Date(e.date).getTime() < Date.now())) && `${e.title} ${e.location} ${e.category}`.toLowerCase().includes(state.search.trim().toLowerCase())).sort((a, b) => state.tab === "open" ? new Date(a.date) - new Date(b.date) : new Date(b.date) - new Date(a.date));
     $("#board-heading-note").innerHTML = `<span class="live-dot"></span> ${state.events.some(e => !e.isExample) ? `${count}개의 탐사가 기다리고 있어요` : "자연을 만나는 다양한 탐사를 준비합니다"}`;
-    $("#board-notice").innerHTML = state.preview ? `<div class="board-example-note">${icon("leaf", 14)}<span><strong>미리보기</strong> · 현재 서버에 연결되지 않아 예시 화면을 보여드려요.<small> 신청과 저장은 서버가 연결된 후 이용할 수 있어요.</small></span><button class="text-button" data-action="reload" style="margin-left:auto;white-space:nowrap">다시 연결</button></div>` : !state.loading && state.events.length && state.events.every(e => e.isExample) ? `<div class="board-example-note">${icon("leaf", 14)}<span>아래 게시물은 예시 탐사입니다.<small> 실제 탐사가 등록되면 이곳에서 바로 신청할 수 있어요.</small></span></div>` : "";
+    $("#board-notice").innerHTML = state.preview ? `<div class="board-example-note">${icon("leaf", 14)}<span><strong>미리보기</strong> · ${state.previewExamples ? "현재 서버에 연결되지 않아 예시 화면을 보여드려요." : "현재 서버에 연결되지 않아 최근 확인한 탐사 목록을 보여드려요."}<small> 신청과 저장은 서버가 연결된 후 이용할 수 있어요.</small></span><button class="text-button" data-action="reload" style="margin-left:auto;white-space:nowrap">다시 연결</button></div>` : !state.loading && state.events.length && state.events.every(e => e.isExample) ? `<div class="board-example-note">${icon("leaf", 14)}<span>아래 게시물은 예시 탐사입니다.<small> 실제 탐사가 등록되면 이곳에서 바로 신청할 수 있어요.</small></span></div>` : "";
     $("#categories").innerHTML = categories.map(c => `<button class="category-chip ${c === state.category ? "selected" : ""}" data-action="category" data-value="${escape(c)}" aria-pressed="${c === state.category}">${icon(categoryIcons[c], 15)}${escape(c)}</button>`).join("");
     $("#board-tabs").innerHTML = [{ key: "open", label: "모집 중" }, { key: "past", label: "지난 탐사" }, { key: "all", label: "전체 탐사" }].map(t => `<button role="tab" aria-selected="${state.tab === t.key}" class="${state.tab === t.key ? "active" : ""}" data-action="tab" data-value="${t.key}">${t.label}${t.key === "open" ? `<span>${count}</span>` : ""}</button>`).join("");
     $("#result-count").innerHTML = `총 <strong>${filtered.length}</strong>개의 탐사`;
     $("#clear-search").hidden = !state.search;
     $("#board-content").innerHTML = state.loading ? `<div class="board-loading"><span class="spinner"></span> 탐사 소식을 가져오고 있어요.</div>` : !filtered.length ? `<div class="empty-state">${icon("leaf", 32)}<h3>${state.search ? "검색 결과가 없어요" : "아직 등록된 탐사가 없어요"}</h3><p>${state.search ? "다른 이름이나 장소로 찾아보세요." : "새로운 탐사 소식을 이곳에서 만나보세요."}</p>${state.admin ? `<button class="button button-outline" data-action="compose">${icon("plus", 15)}탐사 글쓰기</button>` : ""}</div>` : `<div class="expedition-list">${filtered.map(e => { const date = dateParts(e.date); return `<button class="expedition-row" data-action="event" data-id="${escape(e.id)}"><div class="date-block"><span>${escape(date.month)}</span><strong>${escape(date.day)}</strong></div><div class="row-main"><div class="row-meta"><span class="category-label">${icon(categoryIcons[e.category], 12)}${escape(e.category)}</span>${e.isExample ? '<span class="example-badge">예시 탐사</span>' : ""}<span class="row-meta-date">${escape(format(e.date))}</span></div><h3>${escape(e.title)}</h3><div class="row-location">${icon("pin", 13)}${escape(e.location)}</div></div><div class="row-status"><span class="status-badge ${open(e) ? "open" : "closed"}">${open(e) ? "<span></span>" : ""}${status(e)}</span><span class="row-participants">${icon("users", 13)}<strong>${Number(e.count) || 0}</strong>명 신청${e.capacity > 0 ? `<span> / ${Number(e.capacity)}명</span>` : ""}</span></div><span class="row-arrow">${icon("up", 21)}</span></button>`; }).join("")}</div>`;
   }
-  async function loadEvents() {
+  async function loadEvents({ keepEventsOnFailure = !state.previewExamples } = {}) {
     state.loading = true; board();
-    try { const result = await request("/api/expeditions"); if (!Array.isArray(result.events)) throw new Error("Invalid response"); state.events = result.events; state.admin = result.admin === true; state.preview = false; }
-    catch { state.events = examples; state.admin = false; state.preview = true; }
+    try { const result = await request("/api/expeditions"); if (!Array.isArray(result.events)) throw new Error("Invalid response"); state.events = result.events; state.admin = result.admin === true; state.preview = false; state.previewExamples = false; }
+    catch { if (!keepEventsOnFailure) state.events = examples; state.admin = false; state.preview = true; state.previewExamples = !keepEventsOnFailure; }
     finally { state.loading = false; header(); board(); }
   }
-  function modal(mode) { if (!state.mode) previousFocus = document.activeElement; state.mode = mode; state.error = ""; document.body.style.overflow = "hidden"; renderModal(); }
-  function closeModal() { state.mode = null; state.signup = false; state.successName = ""; state.error = ""; $("#modal-root").innerHTML = ""; document.body.style.overflow = ""; const url = new URL(location.href); url.searchParams.delete("expedition"); history.replaceState({}, "", url); previousFocus?.focus(); }
+  function modal(mode) { if (!state.mode) previousFocus = document.activeElement; if (state.mode === "compose" && mode !== "compose") resetPhotos(); state.mode = mode; state.error = ""; document.body.style.overflow = "hidden"; renderModal(); }
+  function closeModal() { if (state.mode === "compose") resetPhotos(); state.mode = null; state.signup = false; state.successName = ""; state.error = ""; $("#modal-root").innerHTML = ""; document.body.style.overflow = ""; const url = new URL(location.href); url.searchParams.delete("expedition"); history.replaceState({}, "", url); previousFocus?.focus(); }
+  function dismissModal() { if (working() && ["delete", "compose"].includes(state.mode)) return; if (state.mode === "delete") { state.mode = "event"; state.error = ""; renderModal(); } else closeModal(); }
   async function showEvent(id, changeUrl = true) {
     state.eventId = id; state.detail = null; state.detailError = ""; state.detailLoading = true; state.signup = false; state.successName = ""; state.application = blankApplication(); state.key = uuid(); modal("event");
     if (changeUrl) { const url = new URL(location.href); url.searchParams.set("expedition", id); history.pushState({}, "", url); }
@@ -88,28 +96,89 @@
   async function loadDetail(id) {
     state.detailLoading = true; state.detailError = "";
     try {
-      if (state.preview) { const event = examples.find(e => e.id === id); if (!event) throw new Error("미리보기에서는 예시 탐사만 확인할 수 있어요."); state.detail = { event, signedUp: [], admin: false }; }
+      if (state.preview) { const event = state.events.find(e => e.id === id); if (!event) throw new Error("탐사 정보를 확인할 수 없어요. 서버에 다시 연결해 주세요."); state.detail = { event, signedUp: [], admin: false }; }
       else { state.detail = await request(`/api/expeditions/${encodeURIComponent(id)}`); state.admin = state.detail.admin === true; }
       if (!state.application.meetingPlace) state.application.meetingPlace = state.detail.event.meetingPlaces[0] || "";
     } catch (error) { state.detailError = error.message; }
     finally { state.detailLoading = false; header(); if (state.mode === "event" && state.eventId === id) renderModal(); }
   }
-  function compose(event) { state.editingId = event?.id || null; state.draft = event ? { title: event.title, category: event.category, date: localDate(event.date), deadline: localDate(event.deadline), location: event.location, description: event.description, meetingPlaces: event.meetingPlaces.join("\n"), capacity: String(event.capacity), status: event.status } : blankDraft(); modal("compose"); }
+  function compose(event) { resetPhotos(); state.photos.existing = (event?.photos || []).filter(photoUrl).map(p => ({ id: p.id, url: p.url })); state.editingId = event?.id || null; state.draft = event ? { title: event.title, category: event.category, date: localDate(event.date), deadline: localDate(event.deadline), location: event.location, description: event.description, meetingPlaces: event.meetingPlaces.join("\n"), capacity: String(event.capacity), status: event.status } : blankDraft(); modal("compose"); }
   const formError = () => state.error ? `<p class="form-error" role="alert">${escape(state.error)}</p>` : "";
   const busyButton = (text, glyph = "check") => `<button class="button full-width" ${state.busy ? "disabled" : ""}>${state.busy ? '<span class="spinner"></span>' : icon(glyph)}${state.busy ? "처리 중…" : text}</button>`;
   function textInput(label, name, value, options = "") { return `<label class="field" for="field-${name}">${label}<input id="field-${name}" name="${name}" value="${escape(value)}" ${options}></label>`; }
   function choices(label, name, value) { return `<fieldset class="choice-field"><legend>${label}</legend><div class="choices"><label class="${value ? "chosen" : ""}"><input type="radio" name="${name}" value="true" ${value ? "checked" : ""}>예 ${icon("check", 15)}</label><label class="${!value ? "chosen" : ""}"><input type="radio" name="${name}" value="false" ${!value ? "checked" : ""}>아니요 ${icon("check", 15)}</label></div></fieldset>`; }
   function applicationForm(event) {
     const a = state.application;
-    return `<form id="application-form" class="application-form"><div class="form-section-title"><h3>함께할 준비, 해볼까요?</h3><p>아래 정보를 남겨 주시면 신청이 완료됩니다.</p></div><div class="two-fields">${textInput('신청자 이름 <span class="required-dot">*</span>', "name", a.name, 'required maxlength="40" autocomplete="name" placeholder="이름을 입력해 주세요"')}${textInput('전화번호 <span class="required-dot">*</span>', "phone", a.phone, 'type="tel" required maxlength="24" autocomplete="tel" placeholder="010-0000-0000"')}</div><div class="two-fields">${choices("쌍안경을 대여할까요?", "binoculars", a.binoculars)}${choices("장화를 대여할까요?", "boots", a.boots)}</div><label class="field" for="field-meetingPlace">집합 장소 <span class="required-dot">*</span><select id="field-meetingPlace" name="meetingPlace" required><option value="">집합 장소를 선택해 주세요</option>${event.meetingPlaces.map(p => `<option ${p === a.meetingPlace ? "selected" : ""} value="${escape(p)}">${escape(p)}</option>`).join("")}</select></label>${choices("탐사 후 식사에 함께할까요?", "meal", a.meal)}<label class="consent"><input type="checkbox" name="consent" required ${a.consent ? "checked" : ""}><span>탐사 운영을 위한 개인정보 수집·이용 및 신청자 이름 공개에 동의합니다.<small>이름과 전화번호, 대여·집합·식사 선택 정보는 탐사 운영을 위해 수집하며, 이름만 게시판에 공개됩니다. 연락처와 상세 선택 정보는 운영자만 확인할 수 있습니다. 수집 정보는 탐사 안내와 준비에 사용됩니다.</small></span></label>${formError()}${busyButton("탐사 신청 완료하기")}</form>`;
+    return `<form id="application-form" class="application-form"><div class="form-section-title"><h3>함께할 준비, 해볼까요?</h3><p>아래 정보를 남겨 주시면 신청이 완료됩니다.</p></div><div class="two-fields">${textInput('신청자 이름 <span class="required-dot">*</span>', "name", a.name, 'required maxlength="40" autocomplete="name" placeholder="이름을 입력해 주세요"')}${textInput('전화번호 <span class="required-dot">*</span>', "phone", a.phone, 'type="tel" required maxlength="24" autocomplete="tel" placeholder="010-0000-0000"')}</div><div class="two-fields">${choices("쌍안경을 대여할까요?", "binoculars", a.binoculars)}${choices("장화를 대여할까요?", "boots", a.boots)}</div><label class="field" for="field-meetingPlace">집합 장소 <span class="required-dot">*</span><select id="field-meetingPlace" name="meetingPlace" required><option value="">집합 장소를 선택해 주세요</option>${event.meetingPlaces.map(p => `<option ${p === a.meetingPlace ? "selected" : ""} value="${escape(p)}">${escape(p)}</option>`).join("")}</select></label>${choices("탐사 후 식사에 함께할까요?", "meal", a.meal)}<label class="field" for="field-message">하고 싶은 말 <span class="field-note">선택 · 최대 1,000자</span><textarea id="field-message" name="message" rows="4" maxlength="1000" aria-describedby="message-help" placeholder="탐사에 관해 전하고 싶은 말을 자유롭게 적어 주세요.">${escape(a.message)}</textarea><small class="field-note" id="message-help">입력한 내용은 운영자만 확인할 수 있어요.</small></label><label class="consent"><input type="checkbox" name="consent" required ${a.consent ? "checked" : ""}><span>탐사 운영을 위한 개인정보 수집·이용 및 신청자 이름 공개에 동의합니다.<small>이름과 전화번호, 대여·집합·식사 선택 정보, 선택 입력한 하고 싶은 말은 탐사 운영을 위해 수집하며, 이름만 게시판에 공개됩니다. 연락처와 상세 선택 정보, 하고 싶은 말은 운영자만 확인할 수 있습니다. 수집 정보는 탐사 안내와 준비에 사용됩니다.</small></span></label>${formError()}${busyButton("탐사 신청 완료하기")}</form>`;
+  }
+  function photoComposer() {
+    const photos = state.photos, count = photos.existing.length + photos.pending.length;
+    const preview = (photo, pending) => `<div class="photo-draft-item"><img src="${escape(pending ? photo.url : photoUrl(photo))}" alt="${escape(pending ? photo.name : "등록된 탐사 사진")}"><button type="button" class="photo-remove" data-action="remove-photo" data-id="${escape(photo.id)}" data-pending="${pending}" aria-label="${escape(pending ? photo.name : "등록된 사진")} 삭제" ${working() ? "disabled" : ""}>${icon("x", 14)}</button><span>${pending ? "저장 시 업로드" : "등록된 사진"}</span></div>`;
+    return `<section class="photo-composer" aria-labelledby="photo-heading"><div class="photo-composer-heading"><h3 id="photo-heading">탐사 사진 <span class="field-note">선택 · 최대 5장</span></h3><span>${count} / 5</span></div><p class="photo-help" id="photo-help">JPG·PNG·WebP 파일을 선택해 주세요. 사진 한 장당 최대 20MB이며, 업로드에 맞게 자동으로 줄여 저장해요. 등록된 사진은 누구나 볼 수 있어요.</p>${count ? `<div class="photo-draft-grid">${photos.existing.map(p => preview(p, false)).join("")}${photos.pending.map(p => preview(p, true)).join("")}</div>` : ""}<label class="photo-picker ${count >= 5 || working() ? "disabled" : ""}" for="field-photos">${state.photoProcessing ? '<span class="spinner"></span>사진 준비 중…' : `${icon("camera", 17)}사진 선택`}<input id="field-photos" type="file" accept="image/jpeg,image/png,image/webp" multiple aria-describedby="photo-help" ${count >= 5 || working() ? "disabled" : ""}></label>${photos.removals.length ? `<p class="photo-help">삭제한 사진 ${photos.removals.length}장은 게시물을 저장하면 반영됩니다.</p>` : ""}</section>`;
+  }
+  function photoGallery(event) {
+    const photos = (event.photos || []).filter(photoUrl);
+    return photos.length ? `<section class="detail-photos" aria-label="탐사 사진"><h3>${icon("camera", 16)}탐사 사진 <span>${photos.length}</span></h3><div class="detail-photo-grid">${photos.map((photo, index) => `<a href="${escape(photoUrl(photo))}" target="_blank" rel="noopener noreferrer" title="사진 크게 보기"><img src="${escape(photoUrl(photo))}" alt="${escape(event.title)} · 사진 ${index + 1}" loading="lazy"><span>크게 보기 ${icon("up", 13)}</span></a>`).join("")}</div></section>` : "";
+  }
+  async function photoSource(file) {
+    if (typeof createImageBitmap === "function") {
+      try { const image = await createImageBitmap(file, { imageOrientation: "from-image" }); return { image, width: image.width, height: image.height, close: () => image.close() }; } catch { /* Use the browser image decoder as a fallback. */ }
+    }
+    const url = URL.createObjectURL(file);
+    try {
+      const image = await new Promise((resolve, reject) => { const element = new Image(); element.onload = () => resolve(element); element.onerror = () => reject(new Error("사진을 읽을 수 없어요. JPG·PNG·WebP 사진을 다시 선택해 주세요.")); element.src = url; });
+      return { image, width: image.naturalWidth, height: image.naturalHeight, close: () => URL.revokeObjectURL(url) };
+    } catch (error) { URL.revokeObjectURL(url); throw error; }
+  }
+  async function compressPhoto(file) {
+    if (!["image/jpeg", "image/png", "image/webp"].includes(file.type)) throw new Error(`${file.name}: JPG·PNG·WebP 사진만 선택할 수 있어요.`);
+    if (!file.size || file.size > 20 * 1024 * 1024) throw new Error(`${file.name}: 사진 한 장은 최대 20MB까지 선택할 수 있어요.`);
+    const source = await photoSource(file);
+    try {
+      if (!(source.width > 0 && source.height > 0)) throw new Error("사진 크기를 읽을 수 없어요. 다른 사진을 선택해 주세요.");
+      const canvas = document.createElement("canvas"), context = canvas.getContext("2d");
+      if (!context) throw new Error("이 브라우저에서 사진을 준비하지 못했어요. 다른 브라우저에서 시도해 주세요.");
+      for (let attempt = 0; attempt < 10; attempt++) {
+        const longest = attempt < 4 ? 1600 : Math.round(1600 * Math.pow(.8, attempt - 3));
+        const ratio = Math.min(1, longest / Math.max(source.width, source.height));
+        canvas.width = Math.max(1, Math.round(source.width * ratio)); canvas.height = Math.max(1, Math.round(source.height * ratio));
+        context.fillStyle = "#ffffff"; context.fillRect(0, 0, canvas.width, canvas.height); context.drawImage(source.image, 0, 0, canvas.width, canvas.height);
+        const blob = await new Promise((resolve, reject) => canvas.toBlob(value => value ? resolve(value) : reject(new Error("사진을 변환하지 못했어요. 다른 사진으로 시도해 주세요.")), "image/jpeg", Math.max(.5, .84 - attempt * .08)));
+        if (blob.type === "image/jpeg" && blob.size > 0 && blob.size <= 1024 * 1024) return blob;
+      }
+      throw new Error("사진 용량을 줄이지 못했어요. 다른 사진으로 시도해 주세요.");
+    } finally { source.close(); }
+  }
+  async function selectPhotos(input) {
+    if (working() || state.mode !== "compose" || !state.admin) return;
+    const files = [...input.files]; if (!files.length) return;
+    readDraft(input.form); input.value = ""; state.error = "";
+    if (state.photos.existing.length + state.photos.pending.length + files.length > 5) { state.error = "탐사 사진은 최대 5장까지 올릴 수 있어요. 기존 사진을 지우거나 선택 수를 줄여 주세요."; renderModal(); return; }
+    state.photoProcessing = true; renderModal(); header();
+    const errors = [];
+    try {
+      for (const file of files) {
+        try { const blob = await compressPhoto(file); state.photos.pending.push({ id: uuid(), blob, name: file.name, url: URL.createObjectURL(blob) }); }
+        catch (error) { errors.push(error.message); }
+      }
+    } finally { state.photoProcessing = false; state.error = errors.join("\n"); header(); if (state.mode === "compose") renderModal(); }
+  }
+  function removePhoto(id, pending) {
+    if (working() || state.mode !== "compose" || !state.admin) return;
+    const form = $("#composer-form"); if (form) readDraft(form);
+    const list = pending ? state.photos.pending : state.photos.existing;
+    const index = list.findIndex(photo => photo.id === id); if (index < 0) return;
+    const [photo] = list.splice(index, 1);
+    if (pending) URL.revokeObjectURL(photo.url); else state.photos.removals.push(photo);
+    state.error = ""; renderModal();
   }
   function composer() {
     const d = state.draft;
-    return `<div class="modal-eyebrow">${icon("sprout", 17)} NEW FIELD NOTE</div><h2 class="modal-title">${state.editingId ? "탐사 게시물 수정" : "새로운 탐사, 새로운 발견"}</h2><p class="modal-description">함께할 탐사의 일정과 준비사항을 알려주세요. 시간은 한국 시간 기준입니다.</p><form id="composer-form" class="composer-form"><div class="two-fields"><div class="field-grow" style="flex:2;min-width:0;width:100%">${textInput("탐사 제목", "title", d.title, 'required maxlength="120" placeholder="예: 가을 철새를 만나는 한강 탐사"')}</div><label class="field">카테고리<select name="category">${categories.slice(1).map(c => `<option ${d.category === c ? "selected" : ""}>${c}</option>`).join("")}</select></label></div><div class="two-fields">${textInput("탐사 일시", "date", d.date, 'type="datetime-local" required')}${textInput("신청 마감", "deadline", d.deadline, `type="datetime-local" required ${d.date ? `max="${escape(d.date)}"` : ""}`)}</div>${textInput("탐사 장소", "location", d.location, 'required maxlength="180" placeholder="탐사가 진행되는 장소"')}<label class="field">탐사 소개 및 안내<textarea name="description" rows="5" required maxlength="6000" placeholder="탐사 내용, 준비물, 집합 안내 등을 적어 주세요.">${escape(d.description)}</textarea></label><label class="field">집합 장소 선택지 <span class="field-note">한 줄에 한 곳씩 입력해 주세요.</span><textarea name="meetingPlaces" rows="3" required placeholder="현장 집합&#10;동아리방 앞">${escape(d.meetingPlaces)}</textarea></label><div class="two-fields">${textInput('모집 인원 <span class="field-note">0으로 설정하면 제한이 없어요.</span>', "capacity", d.capacity, 'type="number" min="0" max="10000" required')}<label class="field">모집 상태<select name="status"><option value="open" ${d.status === "open" ? "selected" : ""}>모집 중</option><option value="closed" ${d.status === "closed" ? "selected" : ""}>신청 마감</option></select></label></div>${state.events.find(e => e.id === state.editingId)?.isExample ? `<p class="example-note">${icon("leaf")}저장하면 예시 표시가 해제되고 실제 신청을 받는 탐사가 됩니다.</p>` : ""}${formError()}<div class="form-actions"><button type="button" class="button button-outline" data-action="close">취소</button><button class="button" ${state.busy ? "disabled" : ""}>${state.busy ? '<span class="spinner"></span>' : icon("plus")}${state.busy ? "저장 중…" : state.editingId ? "수정 내용 저장" : "탐사 게시물 올리기"}</button></div></form>`;
+    return `<div class="modal-eyebrow">${icon("sprout", 17)} NEW FIELD NOTE</div><h2 class="modal-title">${state.editingId ? "탐사 게시물 수정" : "새로운 탐사, 새로운 발견"}</h2><p class="modal-description">함께할 탐사의 일정과 준비사항을 알려주세요. 시간은 한국 시간 기준입니다.</p><form id="composer-form" class="composer-form"><div class="two-fields"><div class="field-grow" style="flex:2;min-width:0;width:100%">${textInput("탐사 제목", "title", d.title, 'required maxlength="120" placeholder="예: 가을 철새를 만나는 한강 탐사"')}</div><label class="field">카테고리<select name="category">${categories.slice(1).map(c => `<option ${d.category === c ? "selected" : ""}>${c}</option>`).join("")}</select></label></div><div class="two-fields">${textInput("탐사 일시", "date", d.date, 'type="datetime-local" required')}${textInput("신청 마감", "deadline", d.deadline, `type="datetime-local" required ${d.date ? `max="${escape(d.date)}"` : ""}`)}</div>${textInput("탐사 장소", "location", d.location, 'required maxlength="180" placeholder="탐사가 진행되는 장소"')}<label class="field">탐사 소개 및 안내<textarea name="description" rows="5" required maxlength="6000" placeholder="탐사 내용, 준비물, 집합 안내 등을 적어 주세요.">${escape(d.description)}</textarea></label>${photoComposer()}<label class="field">집합 장소 선택지 <span class="field-note">한 줄에 한 곳씩 입력해 주세요.</span><textarea name="meetingPlaces" rows="3" required placeholder="현장 집합&#10;동아리방 앞">${escape(d.meetingPlaces)}</textarea></label><div class="two-fields">${textInput('모집 인원 <span class="field-note">0으로 설정하면 제한이 없어요.</span>', "capacity", d.capacity, 'type="number" min="0" max="10000" required')}<label class="field">모집 상태<select name="status"><option value="open" ${d.status === "open" ? "selected" : ""}>모집 중</option><option value="closed" ${d.status === "closed" ? "selected" : ""}>신청 마감</option></select></label></div>${state.events.find(e => e.id === state.editingId)?.isExample ? `<p class="example-note">${icon("leaf")}저장하면 예시 표시가 해제되고 실제 신청을 받는 탐사가 됩니다.</p>` : ""}${formError()}<div class="form-actions"><button type="button" class="button button-outline" data-action="close" ${working() ? "disabled" : ""}>취소</button><button class="button" ${working() ? "disabled" : ""}>${working() ? '<span class="spinner"></span>' : icon("plus")}${state.photoProcessing ? "사진 준비 중…" : state.busy ? "저장 중…" : state.editingId ? "수정 내용 저장" : "탐사 게시물 올리기"}</button></div></form>`;
   }
   function applicants(detail) {
     const event = detail.event, list = detail.applicants || [];
-    return `<div class="participants-section"><div class="participants-heading"><h3>함께하는 사람들 <span>${Number(event.count) || 0}</span></h3>${state.admin && detail.admin ? `<button class="text-button" data-action="csv">${icon("download", 14)}명단 다운로드</button>` : ""}</div>${state.admin && detail.admin ? `<div class="admin-totals"><span>쌍안경 <strong>${list.filter(a => a.binoculars).length}개</strong></span><span>장화 <strong>${list.filter(a => a.boots).length}켤레</strong></span><span>식사 <strong>${list.filter(a => a.meal).length}명</strong></span></div>${list.length ? `<div class="applicants-table-wrap"><table class="applicants-table"><thead><tr><th>이름</th><th>전화번호</th><th>쌍안경</th><th>장화</th><th>집합 장소</th><th>식사</th></tr></thead><tbody>${list.map(a => `<tr><td>${escape(a.name)}</td><td>${escape(a.phone)}</td><td>${a.binoculars ? "대여" : "—"}</td><td>${a.boots ? "대여" : "—"}</td><td>${escape(a.meetingPlace)}</td><td>${a.meal ? "참여" : "—"}</td></tr>`).join("")}</tbody></table></div>` : '<p class="no-participants">아직 신청자가 없어요. 첫 동행을 기다리고 있습니다.</p>'}` : `${detail.signedUp?.length ? `<div class="name-chips">${detail.signedUp.map(a => `<span><span class="name-dot"></span>${escape(a.name)}</span>`).join("")}</div>` : '<p class="no-participants">아직 신청자가 없어요. 첫 동행을 기다리고 있습니다.</p>'}<p class="privacy-note">${icon("lock", 12)}연락처와 상세 신청 정보는 운영자만 확인할 수 있어요.</p>`}</div>`;
+    return `<div class="participants-section"><div class="participants-heading"><h3>함께하는 사람들 <span>${Number(event.count) || 0}</span></h3>${state.admin && detail.admin ? `<button class="text-button" data-action="csv">${icon("download", 14)}명단 다운로드</button>` : ""}</div>${state.admin && detail.admin ? `<div class="admin-totals"><span>쌍안경 <strong>${list.filter(a => a.binoculars).length}개</strong></span><span>장화 <strong>${list.filter(a => a.boots).length}켤레</strong></span><span>식사 <strong>${list.filter(a => a.meal).length}명</strong></span></div>${list.length ? `<div class="applicants-table-wrap"><table class="applicants-table"><thead><tr><th>이름</th><th>전화번호</th><th>쌍안경</th><th>장화</th><th>집합 장소</th><th>식사</th><th>하고 싶은 말</th></tr></thead><tbody>${list.map(a => `<tr><td>${escape(a.name)}</td><td>${escape(a.phone)}</td><td>${a.binoculars ? "대여" : "—"}</td><td>${a.boots ? "대여" : "—"}</td><td>${escape(a.meetingPlace)}</td><td>${a.meal ? "참여" : "—"}</td><td class="applicant-message">${escape(a.message || "—")}</td></tr>`).join("")}</tbody></table></div>` : '<p class="no-participants">아직 신청자가 없어요. 첫 동행을 기다리고 있습니다.</p>'}` : `${detail.signedUp?.length ? `<div class="name-chips">${detail.signedUp.map(a => `<span><span class="name-dot"></span>${escape(a.name)}</span>`).join("")}</div>` : '<p class="no-participants">아직 신청자가 없어요. 첫 동행을 기다리고 있습니다.</p>'}<p class="privacy-note">${icon("lock", 12)}연락처와 상세 신청 정보는 운영자만 확인할 수 있어요.</p>`}</div>`;
   }
   function eventContent() {
     let content = `<button class="detail-back" data-action="${state.signup ? "back-detail" : "close"}">${icon("back", 15)}${state.signup ? "탐사 정보로 돌아가기" : "탐사 게시판"}</button>`;
@@ -117,12 +186,17 @@
     if (state.detailError) return content + `<div class="empty-state"><p role="alert">${escape(state.detailError)}</p><button class="button button-outline" data-action="retry-detail">다시 시도</button></div>`;
     const detail = state.detail; if (!detail) return content;
     const e = detail.event;
-    content += `<div class="detail-heading"><div class="detail-badges"><span class="category-label">${escape(e.category)}</span><span class="status-badge ${open(e) ? "open" : "closed"}">${status(e)}</span>${e.isExample ? '<span class="example-badge">예시 탐사</span>' : ""}</div><h2 class="detail-title">${escape(e.title)}</h2><div class="detail-actions"><button class="text-button" data-action="share">${icon("share", 14)}링크 공유</button>${state.admin ? `<button class="text-button" data-action="edit">게시물 수정 ${icon("up", 14)}</button>` : ""}</div></div>`;
+    content += `<div class="detail-heading"><div class="detail-badges"><span class="category-label">${escape(e.category)}</span><span class="status-badge ${open(e) ? "open" : "closed"}">${status(e)}</span>${e.isExample ? '<span class="example-badge">예시 탐사</span>' : ""}</div><h2 class="detail-title">${escape(e.title)}</h2><div class="detail-actions"><button class="text-button" data-action="share">${icon("share", 14)}링크 공유</button>${state.admin && detail.admin ? `<button class="text-button" data-action="edit" ${state.preview || state.busy ? "disabled" : ""}>게시물 수정 ${icon("up", 14)}</button><button class="text-button text-button-danger" data-action="delete" ${state.preview || state.busy ? "disabled" : ""}>${icon("trash", 14)}게시물 삭제</button>` : ""}</div></div>`;
     if (e.isExample) content += `<div class="example-note">${icon("leaf", 17)}<span>사이트 이용 방법을 보여주는 예시 탐사입니다. 실제 신청은 받지 않아요.${state.admin ? " 게시물을 수정해 실제 탐사로 전환할 수 있어요." : ""}</span></div>`;
     if (state.successName) return content + `<div class="signup-success" role="status"><div class="success-icon">${icon("check", 29)}</div><div class="eyebrow">SEE YOU IN THE FIELD</div><h3>${escape(state.successName)}님, 함께하게 되어 반가워요!</h3><p>탐사 신청이 완료되었어요.<br>아래 탐사 일시와 집합 장소를 확인해 주세요.</p><div class="success-date">${icon("calendar", 17)}${escape(format(e.date, true))}</div><button class="button button-outline" data-action="back-detail">탐사 정보 확인하기 ${icon("arrow", 15)}</button></div>`;
     if (state.signup) return content + applicationForm(e);
-    content += `<div class="detail-facts"><div>${icon("calendar", 19)}<span>탐사 일시<strong>${escape(format(e.date, true))}</strong></span></div><div>${icon("pin", 19)}<span>탐사 장소<strong>${escape(e.location)}</strong></span></div><div>${icon("users", 19)}<span>모집 인원<strong>${e.capacity ? `${Number(e.capacity)}명` : "인원 제한 없음"}</strong></span></div><div>${icon("compass", 19)}<span>신청 마감<strong>${escape(format(e.deadline, true))}</strong></span></div></div><div class="detail-body"><h3>이번 탐사를 소개해요</h3><p>${escape(e.description)}</p><div class="meeting-info">${icon("pin", 17)}<div><strong>집합 장소</strong>${e.meetingPlaces.map(p => `<span>${escape(p)}</span>`).join("")}</div></div></div>${applicants(detail)}<div class="detail-bottom"><div><strong>${Number(e.count) || 0}명이 함께할 예정이에요.</strong><span>${e.isExample ? "실제 탐사 소식이 등록되면 신청해 주세요." : open(e) ? "별도의 가입 없이 바로 신청할 수 있어요." : "이 탐사는 신청이 마감되었습니다."}</span></div><button class="button" data-action="signup" ${e.isExample || !open(e) || state.preview ? "disabled" : ""}>${e.isExample ? "예시 탐사" : open(e) ? "이 탐사에 함께하기" : "신청 마감"}${icon("arrow")}</button></div>`;
+    content += `<div class="detail-facts"><div>${icon("calendar", 19)}<span>탐사 일시<strong>${escape(format(e.date, true))}</strong></span></div><div>${icon("pin", 19)}<span>탐사 장소<strong>${escape(e.location)}</strong></span></div><div>${icon("users", 19)}<span>모집 인원<strong>${e.capacity ? `${Number(e.capacity)}명` : "인원 제한 없음"}</strong></span></div><div>${icon("compass", 19)}<span>신청 마감<strong>${escape(format(e.deadline, true))}</strong></span></div></div><div class="detail-body"><h3>이번 탐사를 소개해요</h3><p>${escape(e.description)}</p>${photoGallery(e)}<div class="meeting-info">${icon("pin", 17)}<div><strong>집합 장소</strong>${e.meetingPlaces.map(p => `<span>${escape(p)}</span>`).join("")}</div></div></div>${applicants(detail)}<div class="detail-bottom"><div><strong>${Number(e.count) || 0}명이 함께할 예정이에요.</strong><span>${e.isExample ? "실제 탐사 소식이 등록되면 신청해 주세요." : open(e) ? "별도의 가입 없이 바로 신청할 수 있어요." : "이 탐사는 신청이 마감되었습니다."}</span></div><button class="button" data-action="signup" ${e.isExample || !open(e) || state.preview ? "disabled" : ""}>${e.isExample ? "예시 탐사" : open(e) ? "이 탐사에 함께하기" : "신청 마감"}${icon("arrow")}</button></div>`;
     return content;
+  }
+  function deleteConfirmation() {
+    const event = state.detail?.event;
+    if (!event) return "";
+    return `<div class="modal-icon modal-icon-danger">${icon("trash", 25)}</div><div class="modal-eyebrow">DELETE FIELD NOTE</div><h2 class="modal-title">게시물을 삭제할까요?</h2><p class="modal-description">이 탐사 게시물과 사진, 연결된 신청자 <strong>${Number(event.count) || 0}명</strong>의 신청 정보가 함께 삭제됩니다. 삭제한 내용은 되돌릴 수 없어요.</p><div class="delete-summary"><strong>${escape(event.title)}</strong><span>${escape(format(event.date, true))}</span></div>${formError()}<div class="form-actions"><button class="button button-outline" data-action="cancel-delete" ${state.busy ? "disabled" : ""}>취소</button><button class="button button-danger" data-action="confirm-delete" ${state.busy || state.preview || !state.admin || !state.detail.admin ? "disabled" : ""}>${state.busy ? '<span class="spinner"></span>삭제 중…' : `${icon("trash")}게시물 삭제`}</button></div>`;
   }
   function renderModal() {
     if (!state.mode) return;
@@ -133,8 +207,10 @@
     if (state.mode === "login") { title = "운영자 로그인"; content = `<div class="modal-icon">${icon("lock", 25)}</div><div class="modal-eyebrow">FOR ORGANIZERS</div><h2 class="modal-title">운영자 모드</h2><p class="modal-description">비밀번호를 입력하면 탐사 게시물을 작성하고<br>신청자의 전체 정보를 확인할 수 있어요.</p>${state.preview ? '<div class="example-note">현재는 미리보기입니다. 서버가 연결되면 운영자 모드를 사용할 수 있어요.</div>' : `<form id="login-form">${textInput("운영자 비밀번호", "password", "", 'type="password" required autocomplete="current-password" placeholder="비밀번호를 입력해 주세요"')}${formError()}${busyButton("운영자 모드로 들어가기", "lock")}</form>`}<p class="modal-fineprint">탐사 신청은 로그인 없이 누구나 할 수 있어요.</p>`; }
     if (state.mode === "compose") { title = state.editingId ? "탐사 수정" : "탐사 글쓰기"; wide = true; content = composer(); }
     if (state.mode === "event") { title = state.detail?.event.title || "탐사 상세"; wide = true; content = eventContent(); }
-    $("#modal-root").innerHTML = `<div class="modal-backdrop" data-backdrop="true"><div class="modal ${wide ? "modal-wide" : ""}" role="dialog" aria-modal="true" aria-label="${escape(title)}" tabindex="-1"><button class="icon-button modal-close" data-action="close" aria-label="닫기">${icon("x", 21)}</button>${content}</div></div>`;
+    if (state.mode === "delete") { title = "게시물 삭제 확인"; content = deleteConfirmation(); }
+    $("#modal-root").innerHTML = `<div class="modal-backdrop" data-backdrop="true"><div class="modal ${wide ? "modal-wide" : ""}" role="dialog" aria-modal="true" aria-label="${escape(title)}" tabindex="-1"><button class="icon-button modal-close" data-action="close" aria-label="${state.mode === "delete" ? "삭제 취소" : "닫기"}" ${["delete", "compose"].includes(state.mode) && working() ? "disabled" : ""}>${icon("x", 21)}</button>${content}</div></div>`;
     $(".modal-backdrop").scrollTop = scroll;
+    if (state.mode === "compose" && working()) $("#composer-form").querySelectorAll("input, textarea, select, button").forEach(element => { element.disabled = true; });
     const focus = activeId && document.getElementById(activeId); (focus || $(".modal")).focus({ preventScroll: true });
   }
   async function login(form) {
@@ -149,7 +225,7 @@
     catch (error) { toast(error.message); }
     finally { state.busy = false; header(); }
   }
-  function readApplication(form) { const data = new FormData(form); state.application = { name: String(data.get("name") || ""), phone: String(data.get("phone") || ""), binoculars: data.get("binoculars") === "true", boots: data.get("boots") === "true", meetingPlace: String(data.get("meetingPlace") || ""), meal: data.get("meal") === "true", consent: data.get("consent") === "on" }; }
+  function readApplication(form) { const data = new FormData(form); state.application = { name: String(data.get("name") || ""), phone: String(data.get("phone") || ""), binoculars: data.get("binoculars") === "true", boots: data.get("boots") === "true", meetingPlace: String(data.get("meetingPlace") || ""), meal: data.get("meal") === "true", message: String(data.get("message") || ""), consent: data.get("consent") === "on" }; }
   function readDraft(form) { const data = new FormData(form); state.draft = Object.fromEntries(["title", "category", "date", "deadline", "location", "description", "meetingPlaces", "capacity", "status"].map(key => [key, String(data.get(key) || "")])); }
   async function apply(form) {
     if (state.preview || !state.detail || state.detail.event.isExample) { toast("실제 탐사가 등록되고 서버가 연결되면 신청할 수 있어요."); return; }
@@ -160,31 +236,73 @@
     finally { state.busy = false; if (state.mode === "event") renderModal(); }
   }
   async function save(form) {
+    if (working()) return;
     if (state.preview || !state.admin) { toast("운영자 모드에서 서버에 연결한 후 저장할 수 있어요."); return; }
-    readDraft(form); state.busy = true; state.error = ""; renderModal();
-    try { const d = state.draft; const payload = { ...d, date: new Date(`${d.date}:00+09:00`).toISOString(), deadline: new Date(`${d.deadline}:00+09:00`).toISOString(), meetingPlaces: d.meetingPlaces.split("\n").map(p => p.trim()).filter(Boolean), capacity: Number(d.capacity), isExample: false }; await request(state.editingId ? `/api/expeditions/${encodeURIComponent(state.editingId)}` : "/api/expeditions", { method: state.editingId ? "PUT" : "POST", body: JSON.stringify(payload) }); await loadEvents(); closeModal(); toast(state.editingId ? "탐사 게시물을 수정했어요." : "새로운 탐사 게시물을 올렸어요."); }
-    catch (error) { state.error = error.message; }
-    finally { state.busy = false; if (state.mode === "compose") renderModal(); }
+    readDraft(form); state.busy = true; state.error = ""; renderModal(); header();
+    const wasEditing = Boolean(state.editingId);
+    let postSaved = false;
+    try {
+      const d = state.draft;
+      const payload = { ...d, date: new Date(`${d.date}:00+09:00`).toISOString(), deadline: new Date(`${d.deadline}:00+09:00`).toISOString(), meetingPlaces: d.meetingPlaces.split("\n").map(p => p.trim()).filter(Boolean), capacity: Number(d.capacity), isExample: false };
+      const result = await request(state.editingId ? `/api/expeditions/${encodeURIComponent(state.editingId)}` : "/api/expeditions", { method: state.editingId ? "PUT" : "POST", body: JSON.stringify(payload) });
+      // A new post (including an edited example) must become an update on retry.
+      const savedId = result.event?.id || result.id || state.editingId;
+      if (!savedId) throw new Error("저장한 게시물 번호를 확인하지 못했어요. 게시판을 확인해 주세요.");
+      state.editingId = savedId; postSaved = true;
+      const path = `/api/expeditions/${encodeURIComponent(savedId)}/photos`;
+      while (state.photos.removals.length) {
+        const photo = state.photos.removals[0];
+        try { await request(`${path}/${encodeURIComponent(photo.id)}`, { method: "DELETE", body: "{}" }); }
+        catch (error) { if (error.status !== 404) throw error; }
+        state.photos.removals.shift();
+      }
+      while (state.photos.pending.length) {
+        const photo = state.photos.pending[0];
+        const upload = await request(path, { method: "POST", headers: { "Content-Type": photo.blob.type, "X-Upload-Id": photo.id }, body: photo.blob });
+        if (!upload.photo?.id || !photoUrl(upload.photo)) throw new Error("사진 저장 결과를 확인하지 못했어요.");
+        state.photos.existing.push({ id: upload.photo.id, url: upload.photo.url });
+        state.photos.pending.shift(); URL.revokeObjectURL(photo.url);
+      }
+      await loadEvents(); closeModal(); toast(wasEditing ? "탐사 게시물을 수정했어요." : "새로운 탐사 게시물을 올렸어요.");
+    } catch (error) { state.error = postSaved ? `게시물은 저장됐지만 사진 변경을 모두 반영하지 못했어요. 사진 선택은 유지되어 있으니 다시 저장해 주세요. ${error.message}` : error.message; }
+    finally { state.busy = false; header(); if (state.mode === "compose") renderModal(); }
+  }
+  async function deleteEvent() {
+    if (state.mode !== "delete" || state.busy || state.preview || !state.admin || !state.detail?.admin) return;
+    const id = state.detail.event.id;
+    state.busy = true; state.error = ""; renderModal(); header();
+    try {
+      await request(`/api/expeditions/${encodeURIComponent(id)}`, { method: "DELETE", body: "{}" });
+      state.events = state.events.filter(event => event.id !== id);
+      state.detail = null; state.eventId = null; closeModal();
+      await loadEvents({ keepEventsOnFailure: true });
+      toast("탐사 게시물과 사진, 신청 정보를 삭제했어요.");
+    } catch (error) { state.error = error.message; }
+    finally { state.busy = false; header(); if (state.mode === "delete") renderModal(); }
   }
   function exportCsv() {
     if (!state.admin || !state.detail?.admin) return;
-    const rows = [["이름", "전화번호", "쌍안경 대여", "장화 대여", "집합 장소", "식사", "신청일"], ...(state.detail.applicants || []).map(a => [a.name, a.phone, a.binoculars ? "예" : "아니요", a.boots ? "예" : "아니요", a.meetingPlace, a.meal ? "예" : "아니요", format(a.createdAt, true)])];
-    const csv = "\uFEFF" + rows.map(row => row.map(value => { const v = String(value); return `"${(/^[=+@-]/.test(v) ? "'" : "") + v.replaceAll('"', '""')}"`; }).join(",")).join("\r\n");
+    const rows = [["이름", "전화번호", "쌍안경 대여", "장화 대여", "집합 장소", "식사", "하고 싶은 말", "신청일"], ...(state.detail.applicants || []).map(a => [a.name, a.phone, a.binoculars ? "예" : "아니요", a.boots ? "예" : "아니요", a.meetingPlace, a.meal ? "예" : "아니요", a.message || "", format(a.createdAt, true)])];
+    const csv = "\uFEFF" + rows.map(row => row.map(value => { const v = String(value ?? ""); return `"${(/^[\s\uFEFF]*[=+@-]/.test(v) ? "'" : "") + v.replaceAll('"', '""')}"`; }).join(",")).join("\r\n");
     const url = URL.createObjectURL(new Blob([csv], { type: "text/csv;charset=utf-8;" })); const link = document.createElement("a"); link.href = url; link.download = `VITALL_${state.detail.event.title}_신청자.csv`; link.click(); setTimeout(() => URL.revokeObjectURL(url), 1000);
   }
   document.addEventListener("click", event => {
-    if (event.target.matches?.('[data-backdrop="true"]')) { closeModal(); return; }
+    if (event.target.matches?.('[data-backdrop="true"]')) { dismissModal(); return; }
     const button = event.target.closest?.("[data-action]"); if (!button || button.disabled) return;
     const action = button.dataset.action;
+    if (working() && ["delete", "compose"].includes(state.mode)) return;
     if (action === "category") { state.category = button.dataset.value; board(); }
     else if (action === "tab") { state.tab = button.dataset.value; board(); }
     else if (action === "clear-search") { state.search = ""; $("#search").value = ""; board(); $("#search").focus(); }
     else if (action === "event") void showEvent(button.dataset.id);
     else if (action === "about" || action === "login") modal(action);
-    else if (action === "close") closeModal();
+    else if (action === "close" || action === "cancel-delete") dismissModal();
     else if (action === "explore") { closeModal(); $("#board").scrollIntoView({ behavior: "smooth" }); }
     else if (action === "compose") { if (state.admin) compose(); }
-    else if (action === "edit") { if (state.admin && state.detail) compose(state.detail.event); }
+    else if (action === "edit") { if (!state.busy && !state.preview && state.admin && state.detail?.admin) compose(state.detail.event); }
+    else if (action === "delete") { if (!state.busy && !state.preview && state.admin && state.detail?.admin) { state.signup = false; state.successName = ""; modal("delete"); $(".modal-backdrop").scrollTop = 0; } }
+    else if (action === "confirm-delete") void deleteEvent();
+    else if (action === "remove-photo") removePhoto(button.dataset.id, button.dataset.pending === "true");
     else if (action === "signup") { if (state.detail && open(state.detail.event) && !state.detail.event.isExample && !state.preview) { state.signup = true; state.error = ""; renderModal(); $(".modal-backdrop").scrollTop = 0; } }
     else if (action === "back-detail") { state.signup = false; state.successName = ""; state.error = ""; renderModal(); }
     else if (action === "logout") void logout();
@@ -199,16 +317,17 @@
     if (field.closest?.("#application-form")) { readApplication(field.form); if (field.type === "radio") field.closest(".choices").querySelectorAll("label").forEach(label => label.classList.toggle("chosen", label.querySelector("input").checked)); }
     if (field.closest?.("#composer-form")) { readDraft(field.form); if (field.name === "date") field.form.elements.deadline.max = field.value; }
   });
-  document.addEventListener("submit", event => { if (!["login-form", "application-form", "composer-form"].includes(event.target.id)) return; event.preventDefault(); if (state.busy) return; if (event.target.id === "login-form") void login(event.target); if (event.target.id === "application-form") void apply(event.target); if (event.target.id === "composer-form") void save(event.target); });
+  document.addEventListener("change", event => { if (event.target.id === "field-photos") void selectPhotos(event.target); });
+  document.addEventListener("submit", event => { if (!["login-form", "application-form", "composer-form"].includes(event.target.id)) return; event.preventDefault(); if (working()) return; if (event.target.id === "login-form") void login(event.target); if (event.target.id === "application-form") void apply(event.target); if (event.target.id === "composer-form") void save(event.target); });
   document.addEventListener("keydown", event => {
     if (!state.mode) return;
-    if (event.key === "Escape") { closeModal(); return; }
+    if (event.key === "Escape") { dismissModal(); return; }
     if (event.key !== "Tab") return;
     const dialog = $(".modal"); const items = [...dialog.querySelectorAll('button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled]), a[href], [tabindex="0"]')];
     if (!items.length) return; const first = items[0], last = items.at(-1);
     if (event.shiftKey && (document.activeElement === first || document.activeElement === dialog)) { event.preventDefault(); last.focus(); } else if (!event.shiftKey && document.activeElement === last) { event.preventDefault(); first.focus(); }
   });
-  window.addEventListener("popstate", () => { const id = new URLSearchParams(location.search).get("expedition"); if (id) void showEvent(id, false); else closeModal(); });
+  window.addEventListener("popstate", () => { if (working() && ["compose", "delete"].includes(state.mode)) return; if (state.mode === "compose") resetPhotos(); const id = new URLSearchParams(location.search).get("expedition"); if (id) void showEvent(id, false); else closeModal(); });
   setInterval(() => { board(); if (state.mode === "event" && !state.signup && !state.busy) renderModal(); }, 60000);
   shell();
   loadEvents().then(() => { const id = new URLSearchParams(location.search).get("expedition"); if (id) void showEvent(id, false); });

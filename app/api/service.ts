@@ -7,6 +7,10 @@ const categories = ['조류','식물','습지','곤충','기타'];
 const cookieName = 'vitall_admin';
 const sessionSeconds = 8 * 60 * 60;
 type Row = Record<string, any>;
+type Photo = { id:string; url:string };
+const photoLimit = 5;
+const photoMaxBytes = 1024 * 1024;
+const photoTypes = new Set(['image/jpeg','image/png','image/webp']);
 
 const examples = [
   {id:'example-birds', title:'가을 철새를 만나는 미호강 탐사', category:'조류', date:'2026-10-24T00:00:00.000Z', deadline:'2026-10-23T09:00:00.000Z', location:'청주 미호강 일대', description:'미호강을 따라 걸으며 가을 철새의 움직임을 관찰합니다. 처음 탐조를 시작하는 분도 함께할 수 있어요.\n\n준비물: 편한 복장, 물, 개인 관찰 도구\n쌍안경이 없다면 대여를 선택해 주세요.\n\n이 게시물은 화면 안내를 위한 예시입니다. 실제 탐사 일정은 운영자가 등록합니다.', meetingPlaces:['충북대학교 정문','미호강 현장 집합'], capacity:20, status:'open',isExample:true,count:0},
@@ -24,20 +28,34 @@ async function currentAdmin(req:Request) {
   return !!row && row.expires_at > Date.now();
 }
 async function requireAdmin(req:Request) { if(!await currentAdmin(req)) throw new HttpError(401,'운영자 비밀번호를 먼저 입력해 주세요.'); }
-async function body(req:Request) {
+function checkOrigin(req:Request) {
   const origin=req.headers.get('origin');
   if(origin && origin !== new URL(req.url).origin) throw new HttpError(403,'허용되지 않은 요청입니다.');
+}
+async function body(req:Request) {
+  checkOrigin(req);
   if(!req.headers.get('content-type')?.includes('application/json')) throw new HttpError(415,'JSON 형식으로 요청해 주세요.');
   const raw=await req.text(); if(raw.length>16000) throw new HttpError(413,'입력 내용이 너무 깁니다.');
   try {const value=JSON.parse(raw); if(!value || typeof value!=='object' || Array.isArray(value)) throw 0; return value;} catch {throw new HttpError(400,'입력 내용을 확인해 주세요.');}
 }
 function string(value:unknown, label:string, min=1, max=200) { if(typeof value!=='string' || value.trim().length<min || value.trim().length>max) throw new HttpError(400,`${label}을(를) 확인해 주세요.`); return value.trim(); }
-function mapEvent(r:Row){return {id:r.id,title:r.title,category:r.category,date:r.date,deadline:r.deadline,location:r.location,description:r.description,meetingPlaces:JSON.parse(r.meeting_places),capacity:r.capacity,status:r.status,isExample:!!r.is_example,count:Number(r.count||0)};}
-async function eventRows() {const rows=await db().prepare('SELECT e.*, (SELECT COUNT(*) FROM applicants a WHERE a.event_id=e.id) AS count FROM expeditions e ORDER BY e.date DESC').all<Row>();return rows.results.map(mapEvent);}
+const photoMetadata = (id:string):Photo => ({id,url:'/api/photos/'+encodeURIComponent(id)});
+async function eventPhotos(id:string) {return (await db().prepare('SELECT id FROM expedition_photos WHERE event_id=? ORDER BY created_at,id').bind(id).all<{id:string}>()).results.map(r=>photoMetadata(r.id));}
+function mapEvent(r:Row,photos:Photo[]=[]){return {id:r.id,title:r.title,category:r.category,date:r.date,deadline:r.deadline,location:r.location,description:r.description,meetingPlaces:JSON.parse(r.meeting_places),capacity:r.capacity,status:r.status,isExample:!!r.is_example,count:Number(r.count||0),photos};}
+async function eventRows() {
+  const [rows,photos]=await Promise.all([
+    db().prepare('SELECT e.*, (SELECT COUNT(*) FROM applicants a WHERE a.event_id=e.id) AS count FROM expeditions e ORDER BY e.date DESC').all<Row>(),
+    db().prepare('SELECT id,event_id FROM expedition_photos ORDER BY created_at,id').all<{id:string,event_id:string}>(),
+  ]);
+  const byEvent=new Map<string,Photo[]>();
+  for(const photo of photos.results) {const group=byEvent.get(photo.event_id)||[];group.push(photoMetadata(photo.id));byEvent.set(photo.event_id,group);}
+  return rows.results.map(row=>mapEvent(row,byEvent.get(row.id)||[]));
+}
+async function visibleExamples() {const deleted=(await db().prepare('SELECT id FROM deleted_examples').all<{id:string}>()).results;const ids=new Set(deleted.map(r=>r.id));return examples.filter(e=>!ids.has(e.id)).map(e=>({...e,photos:[] as Photo[]}));}
 async function eventById(id:string) {
   const row=await db().prepare('SELECT e.*, (SELECT COUNT(*) FROM applicants a WHERE a.event_id=e.id) AS count FROM expeditions e WHERE e.id=?').bind(id).first<Row>();
-  if(row) return mapEvent(row);
-  const example=examples.find(e=>e.id===id); if(example) return example;
+  if(row) return mapEvent(row,await eventPhotos(id));
+  const example=examples.find(e=>e.id===id); if(example && !await db().prepare('SELECT id FROM deleted_examples WHERE id=?').bind(id).first()) return {...example,photos:[] as Photo[]};
   throw new HttpError(404,'탐사 게시물을 찾을 수 없습니다.');
 }
 function eventInput(b:Row) {
@@ -53,7 +71,38 @@ function eventInput(b:Row) {
   return {title,category,date:date.toISOString(),deadline:deadline.toISOString(),location,description,meetingPlaces,capacity,status:b.status,isExample:!!b.isExample};
 }
 
-export async function api(req:Request, action:string, id?:string):Promise<Response> {
+async function readPhoto(req:Request) {
+  const length=req.headers.get('content-length');
+  if(length && Number(length)>photoMaxBytes) throw new HttpError(413,'사진은 한 장당 1MB 이하로 올려주세요.');
+  if(!req.body) throw new HttpError(400,'사진 파일을 선택해 주세요.');
+  const reader=req.body.getReader(),chunks:Uint8Array[]=[];let size=0;
+  try {
+    while(true) {
+      const chunk=await reader.read();if(chunk.done) break;
+      size+=chunk.value.byteLength;
+      if(size>photoMaxBytes) {await reader.cancel();throw new HttpError(413,'사진은 한 장당 1MB 이하로 올려주세요.');}
+      chunks.push(chunk.value);
+    }
+  } finally {reader.releaseLock();}
+  if(!size) throw new HttpError(400,'빈 사진 파일은 올릴 수 없습니다.');
+  const bytes=new Uint8Array(size);let offset=0;
+  for(const chunk of chunks) {bytes.set(chunk,offset);offset+=chunk.byteLength;}
+  return bytes;
+}
+function sniffPhoto(bytes:Uint8Array) {
+  if(bytes.length>=3 && bytes[0]===0xff && bytes[1]===0xd8 && bytes[2]===0xff) return 'image/jpeg';
+  if(bytes.length>=8 && [0x89,0x50,0x4e,0x47,0x0d,0x0a,0x1a,0x0a].every((value,index)=>bytes[index]===value)) return 'image/png';
+  if(bytes.length>=12 && bytes[0]===0x52 && bytes[1]===0x49 && bytes[2]===0x46 && bytes[3]===0x46 && bytes[8]===0x57 && bytes[9]===0x45 && bytes[10]===0x42 && bytes[11]===0x50) return 'image/webp';
+  return null;
+}
+function photoBytes(value:unknown) {
+  if(value instanceof ArrayBuffer) return new Uint8Array(value);
+  if(value instanceof Uint8Array) return new Uint8Array(value);
+  if(Array.isArray(value) && value.every(v=>Number.isInteger(v)&&v>=0&&v<=255)) return Uint8Array.from(value);
+  throw new HttpError(500,'사진을 불러올 수 없습니다.');
+}
+
+export async function api(req:Request, action:string, id?:string, photoId?:string):Promise<Response> {
   try {
     if(!db()) throw new HttpError(503,'저장소 연결을 준비 중입니다. 잠시 후 다시 시도해 주세요.');
     if(action==='login') {
@@ -77,21 +126,71 @@ export async function api(req:Request, action:string, id?:string):Promise<Respon
       if(token) await db().prepare('DELETE FROM admin_sessions WHERE token_hash=?').bind(await digest(token)).run();
       return json({success:true},200,{'Set-Cookie':`${cookieName}=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0; Secure`});
     }
-    if(action==='list' && req.method==='GET') {const events=await eventRows();return json({events:events.length?events:examples,admin:await currentAdmin(req)});}
+    if(action==='photo' && req.method==='GET' && id) {
+      const photo=await db().prepare('SELECT p.data,p.content_type FROM expedition_photos p JOIN expeditions e ON e.id=p.event_id WHERE p.id=?').bind(id).first<Row>();
+      if(!photo || !photoTypes.has(photo.content_type)) throw new HttpError(404,'사진을 찾을 수 없습니다.');
+      const bytes=photoBytes(photo.data);
+      return new Response(bytes.buffer as ArrayBuffer,{headers:{'Content-Type':photo.content_type,'Content-Length':String(bytes.byteLength),'X-Content-Type-Options':'nosniff','Cache-Control':'no-store'}});
+    }
+    if(action==='uploadPhoto' && req.method==='POST' && id) {
+      await requireAdmin(req);checkOrigin(req);
+      if(!await db().prepare('SELECT id FROM expeditions WHERE id=?').bind(id).first()) {
+        await eventById(id);
+        throw new HttpError(400,'예시 탐사는 먼저 실제 게시물로 저장한 뒤 사진을 올려주세요.');
+      }
+      const contentType=(req.headers.get('content-type')||'').split(';')[0].trim().toLowerCase();
+      if(!photoTypes.has(contentType)) throw new HttpError(415,'JPG, PNG, WebP 사진만 올릴 수 있습니다.');
+      const uploadId=(req.headers.get('x-upload-id')||'').toLowerCase();
+      if(!/^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/.test(uploadId)) throw new HttpError(400,'사진 업로드 식별값을 확인해 주세요.');
+      const bytes=await readPhoto(req);
+      if(sniffPhoto(bytes)!==contentType) throw new HttpError(415,'사진 파일의 형식이 올바르지 않습니다. JPG, PNG, WebP 파일을 선택해 주세요.');
+      const data=bytes.buffer as ArrayBuffer;
+      const sha256=Array.from(new Uint8Array(await crypto.subtle.digest('SHA-256',data)),v=>v.toString(16).padStart(2,'0')).join('');
+      const previous=()=>db().prepare('SELECT event_id,content_type,sha256 FROM expedition_photos WHERE id=?').bind(uploadId).first<Row>();
+      const same=(row:Row)=>row.event_id===id&&row.content_type===contentType&&row.sha256===sha256;
+      const prior=await previous();
+      if(prior) {if(!same(prior)) throw new HttpError(409,'같은 업로드 식별값으로 다른 사진을 올릴 수 없습니다.');return json({success:true,photo:photoMetadata(uploadId)});}
+      const result=await db().prepare('INSERT INTO expedition_photos (id,event_id,content_type,data,sha256,size,created_at) SELECT ?,e.id,?,?,?,?,? FROM expeditions e WHERE e.id=? AND (SELECT COUNT(*) FROM expedition_photos p WHERE p.event_id=e.id)<? ON CONFLICT(id) DO NOTHING').bind(uploadId,contentType,data,sha256,bytes.byteLength,new Date().toISOString(),id,photoLimit).run();
+      if(!result.meta.changes) {
+        const retry=await previous();
+        if(retry) {if(!same(retry)) throw new HttpError(409,'같은 업로드 식별값으로 다른 사진을 올릴 수 없습니다.');return json({success:true,photo:photoMetadata(uploadId)});}
+        if(!await db().prepare('SELECT id FROM expeditions WHERE id=?').bind(id).first()) throw new HttpError(404,'탐사 게시물을 찾을 수 없습니다.');
+        throw new HttpError(409,'사진은 게시물당 최대 5장까지 올릴 수 있습니다.');
+      }
+      return json({success:true,photo:photoMetadata(uploadId)},201);
+    }
+    if(action==='deletePhoto' && req.method==='DELETE' && id && photoId) {
+      await requireAdmin(req);await body(req);
+      await db().prepare('DELETE FROM expedition_photos WHERE id=? AND event_id=?').bind(photoId,id).run();
+      return json({success:true});
+    }
+    if(action==='list' && req.method==='GET') {const events=await eventRows();return json({events:events.length?events:await visibleExamples(),admin:await currentAdmin(req)});}
     if(action==='detail' && req.method==='GET' && id) {
       const event=await eventById(id),admin=await currentAdmin(req);
       const signedUp=event.isExample?[]:(await db().prepare('SELECT name FROM applicants WHERE event_id=? ORDER BY created_at, id').bind(id).all<{name:string}>()).results;
       if(!admin) return json({event,signedUp,admin:false});
-      const rows=event.isExample?[]:(await db().prepare('SELECT id,name,phone,binoculars,boots,meeting_place,meal,created_at FROM applicants WHERE event_id=? ORDER BY created_at,id').bind(id).all<Row>()).results;
-      return json({event,signedUp,admin:true,applicants:rows.map(r=>({id:r.id,name:r.name,phone:r.phone,binoculars:!!r.binoculars,boots:!!r.boots,meetingPlace:r.meeting_place,meal:!!r.meal,createdAt:r.created_at}))});
+      const rows=event.isExample?[]:(await db().prepare('SELECT id,name,phone,binoculars,boots,meeting_place,meal,message,created_at FROM applicants WHERE event_id=? ORDER BY created_at,id').bind(id).all<Row>()).results;
+      return json({event,signedUp,admin:true,applicants:rows.map(r=>({id:r.id,name:r.name,phone:r.phone,binoculars:!!r.binoculars,boots:!!r.boots,meetingPlace:r.meeting_place,meal:!!r.meal,message:r.message,createdAt:r.created_at}))});
+    }
+    if(action==='delete' && req.method==='DELETE' && id) {
+      await requireAdmin(req);await body(req);await eventById(id);
+      const statements=[db().prepare('DELETE FROM expedition_photos WHERE event_id=?').bind(id),db().prepare('DELETE FROM applicants WHERE event_id=?').bind(id),db().prepare('DELETE FROM expeditions WHERE id=?').bind(id)];
+      if(examples.some(e=>e.id===id)) statements.push(db().prepare('INSERT INTO deleted_examples (id,created_at) VALUES (?,?) ON CONFLICT(id) DO NOTHING').bind(id,new Date().toISOString()));
+      await db().batch(statements);
+      return json({success:true});
     }
     if(action==='save') {
-      await requireAdmin(req);const b=await body(req),e=eventInput(b),eventId=id&&!id.startsWith('example-')?id:crypto.randomUUID();
-      if(req.method==='PUT'&&id) {
+      await requireAdmin(req);const b=await body(req),e=eventInput(b),updating=req.method==='PUT'&&!!id;
+      let virtualUpdate=false;
+      if(updating&&id) {
         const old=await eventById(id);
         if(e.capacity>0&&e.capacity<old.count) throw new HttpError(400,'정원을 현재 신청 인원보다 적게 설정할 수 없습니다.');
+        virtualUpdate=examples.some(example=>example.id===id)&&!await db().prepare('SELECT id FROM expeditions WHERE id=?').bind(id).first();
       }
-      const saved=await db().prepare('INSERT INTO expeditions (id,title,category,date,deadline,location,description,meeting_places,capacity,status,is_example,created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET title=excluded.title,category=excluded.category,date=excluded.date,deadline=excluded.deadline,location=excluded.location,description=excluded.description,meeting_places=excluded.meeting_places,capacity=excluded.capacity,status=excluded.status,is_example=excluded.is_example WHERE (excluded.capacity=0 OR excluded.capacity >= (SELECT COUNT(*) FROM applicants WHERE event_id=expeditions.id)) AND NOT EXISTS (SELECT 1 FROM applicants a WHERE a.event_id=expeditions.id AND NOT EXISTS (SELECT 1 FROM json_each(excluded.meeting_places) p WHERE p.value=a.meeting_place))').bind(eventId,e.title,e.category,e.date,e.deadline,e.location,e.description,JSON.stringify(e.meetingPlaces),e.capacity,e.status,e.isExample?1:0,new Date().toISOString()).run();
+      const eventId=updating&&!virtualUpdate?id!:crypto.randomUUID(),places=JSON.stringify(e.meetingPlaces);
+      const saved=updating&&!virtualUpdate
+        ? await db().prepare('UPDATE expeditions SET title=?,category=?,date=?,deadline=?,location=?,description=?,meeting_places=?,capacity=?,status=?,is_example=? WHERE id=? AND (?=0 OR ? >= (SELECT COUNT(*) FROM applicants WHERE event_id=expeditions.id)) AND NOT EXISTS (SELECT 1 FROM applicants a WHERE a.event_id=expeditions.id AND NOT EXISTS (SELECT 1 FROM json_each(?) p WHERE p.value=a.meeting_place))').bind(e.title,e.category,e.date,e.deadline,e.location,e.description,places,e.capacity,e.status,e.isExample?1:0,eventId,e.capacity,e.capacity,places).run()
+        : await db().prepare('INSERT INTO expeditions (id,title,category,date,deadline,location,description,meeting_places,capacity,status,is_example,created_at) SELECT ?,?,?,?,?,?,?,?,?,?,?,? WHERE NOT EXISTS (SELECT 1 FROM deleted_examples WHERE id=?)').bind(eventId,e.title,e.category,e.date,e.deadline,e.location,e.description,places,e.capacity,e.status,e.isExample?1:0,new Date().toISOString(),virtualUpdate?id:'').run();
       if(!saved.meta.changes) throw new HttpError(409,'신청 현황이 변경되었습니다. 정원과 신청자가 선택한 집합 장소를 확인해 주세요.');
       return json({success:true,event:await eventById(eventId)},req.method==='POST'?201:200);
     }
@@ -101,10 +200,10 @@ export async function api(req:Request, action:string, id?:string):Promise<Respon
       if(!/^0\d{8,10}$/.test(phone)) throw new HttpError(400,'전화번호를 올바르게 입력해 주세요.');
       if(typeof b.binoculars!=='boolean'||typeof b.boots!=='boolean'||typeof b.meal!=='boolean') throw new HttpError(400,'대여 여부와 식사 여부를 선택해 주세요.');
       if(b.consent!==true) throw new HttpError(400,'개인정보 수집 안내에 동의해 주세요.');
-      const meetingPlace=string(b.meetingPlace,'집합 장소',1,150),key=string(b.idempotencyKey,'신청 식별값',8,100);
+      const meetingPlace=string(b.meetingPlace,'집합 장소',1,150),key=string(b.idempotencyKey,'신청 식별값',8,100),message=string(b.message===undefined?'':b.message,'하고 싶은 말',0,1000);
       if(!event.meetingPlaces.includes(meetingPlace)) throw new HttpError(400,'등록된 집합 장소를 선택해 주세요.');
-      const previousApplication=()=>db().prepare('SELECT event_id,name,phone,binoculars,boots,meeting_place,meal FROM applicants WHERE idempotency_key=?').bind(key).first<Row>();
-      const sameApplication=(r:Row)=>r.event_id===id&&r.name===name&&r.phone===phone&&Number(r.binoculars)===(b.binoculars?1:0)&&Number(r.boots)===(b.boots?1:0)&&r.meeting_place===meetingPlace&&Number(r.meal)===(b.meal?1:0);
+      const previousApplication=()=>db().prepare('SELECT event_id,name,phone,binoculars,boots,meeting_place,meal,message FROM applicants WHERE idempotency_key=?').bind(key).first<Row>();
+      const sameApplication=(r:Row)=>r.event_id===id&&r.name===name&&r.phone===phone&&Number(r.binoculars)===(b.binoculars?1:0)&&Number(r.boots)===(b.boots?1:0)&&r.meeting_place===meetingPlace&&Number(r.meal)===(b.meal?1:0)&&r.message===message;
       const prior=await previousApplication();
       if(prior) {if(!sameApplication(prior)) throw new HttpError(409,'신청 정보를 다시 확인해 주세요.');return json({success:true,name,count:(await eventById(id)).count});}
       const now=new Date().toISOString();
@@ -117,7 +216,7 @@ export async function api(req:Request, action:string, id?:string):Promise<Respon
         throw new HttpError(409,'동일한 이름과 전화번호로 이미 신청하셨습니다.');
       }
       try {
-        const result=await db().prepare('INSERT INTO applicants (id,event_id,name,phone,binoculars,boots,meeting_place,meal,idempotency_key,created_at) SELECT ?,id,?,?,?,?,?,?,?,? FROM expeditions WHERE id=? AND status=\'open\' AND is_example=0 AND deadline>? AND date>? AND (capacity=0 OR (SELECT COUNT(*) FROM applicants WHERE event_id=?)<capacity) AND EXISTS (SELECT 1 FROM json_each(expeditions.meeting_places) p WHERE p.value=?)').bind(crypto.randomUUID(),name,phone,b.binoculars?1:0,b.boots?1:0,meetingPlace,b.meal?1:0,key,now,id,now,now,id,meetingPlace).run();
+        const result=await db().prepare('INSERT INTO applicants (id,event_id,name,phone,binoculars,boots,meeting_place,meal,message,idempotency_key,created_at) SELECT ?,id,?,?,?,?,?,?,?,?,? FROM expeditions WHERE id=? AND status=\'open\' AND is_example=0 AND deadline>? AND date>? AND (capacity=0 OR (SELECT COUNT(*) FROM applicants WHERE event_id=?)<capacity) AND EXISTS (SELECT 1 FROM json_each(expeditions.meeting_places) p WHERE p.value=?)').bind(crypto.randomUUID(),name,phone,b.binoculars?1:0,b.boots?1:0,meetingPlace,b.meal?1:0,message,key,now,id,now,now,id,meetingPlace).run();
         if(!result.meta.changes) throw new HttpError(409,'신청이 마감되었거나 정원 또는 집합 장소가 변경되었습니다.');
       } catch(err) {
         const retry=await previousApplication();
